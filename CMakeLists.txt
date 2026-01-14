@@ -190,7 +190,6 @@ else()
 endif()
 
 catkin_install_python(PROGRAMS 
-  src/mpc_node.py
   script/generate_acados_solver.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
