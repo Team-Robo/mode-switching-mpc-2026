@@ -1,0 +1,33 @@
+<launch>
+    <!-- Start the navigation stack -->
+    <!-- The configuration files are loaded from jackal_helper -->
+    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+
+        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+            command="load" ns="global_costmap" />
+        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+            command="load" ns="local_costmap" />
+
+        <rosparam
+            file="$(find jackal_helper)/configs/params/odom_nav_params/global_costmap_params.yaml"
+            command="load" />
+        <rosparam
+            file="$(find jackal_helper)/configs/params/odom_nav_params/local_costmap_params.yaml"
+            command="load" />
+
+        <rosparam file="$(find jackal_helper)/configs/params/base_local_planner_params.yaml"
+            command="load" />
+        <rosparam file="$(find jackal_helper)/configs/params/move_base_params.yaml" command="load" />
+
+        <param name="base_global_planner" type="string" value="navfn/NavfnROS" />
+        <!-- <param name="base_global_planner" type="string" value="carrot_planner/CarrotPlanner" /> -->
+
+        <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />
+        <param name="NavfnROS/default_tolerance" value="0.1" />
+        <remap from="odom" to="odometry/filtered" />
+        <remap from="cmd_vel" to="dump/cmd_vel" />
+    </node>
+	<node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud"></node>
+    <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud"></node>
+    <node pkg="teamrobo2026" type="mpc_node" name="teamrobo2026" output="screen"></node>
+</launch>
