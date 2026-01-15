@@ -1,4 +1,5 @@
 # Mode Switching MPC 2026
+Note: There are some old commits in the archived 2026 MPC codbase, do check if needed
 
 ## Installation
 1) Clone this repo
