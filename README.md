@@ -1,5 +1,5 @@
 # Mode Switching MPC 2026
-Note: There are some old commits in the archived 2026 MPC codbase, do check if needed
+ Note: There are some old commits in the archived 2026 MPC codbase from cpp-convert branch, do check if needed since most are based from this specific branch
 
 ## Installation
 1) Clone this repo
