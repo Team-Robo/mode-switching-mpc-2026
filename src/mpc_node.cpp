@@ -194,6 +194,18 @@ double MPCNode::diffAngle(double a1, double a2) {
     return diff;
 }
 
+bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
+    // Transform obstacle to robot's local frame
+    double dx = ox - rx;
+    double dy = oy - ry;
+
+    // Rotate by -rtheta. We only care about the new Y coordinate (Lateral distance)
+    // local_y = -sin(theta)*dx + cos(theta)*dy
+    double local_y = -std::sin(rtheta) * dx + std::cos(rtheta) * dy;
+
+    return local_y > 0; // Positive Y is Left
+}
+
 bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
                                    double current_theta) {
     // Check if more than 50% of trajectory points require reversal
@@ -272,13 +284,17 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& obs_x,
                        const std::vector<double>& obs_y) {
     
-    // Set initial state constraint (x0 = current_state)
+    // =========================================================================
+    // 1. SET INITIAL STATE CONSTRAINT
+    // =========================================================================
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, 
                                   "lbx", (void*)current_state.data());
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, 
                                   "ubx", (void*)current_state.data());
     
-    // Determine control mode based on obstacles
+    // =========================================================================
+    // 2. DETERMINE CONTROL MODE (SAFE / CAREFUL / OBSTACLE)
+    // =========================================================================
     bool has_close_obstacles = false;
     if (!obs_x.empty()) {
         for (size_t i = 0; i < obs_x.size(); ++i) {
@@ -292,28 +308,31 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         }
     }
     
-    // Update mode and parameters
+    // Define max velocity variable for this iteration
+    double current_v_max_total = 0.8; // Default
+
+    // Update logic based on obstacles
     if (obs_x.empty()) {
         mode_ = ControlMode::SAFE;
-        v_max_total_ = 0.8;
+        current_v_max_total = 0.8; //
         v_ref_ = 0.8;
         weight_acceleration_ = 1.0;
         display_text_ = "SAFE";
     } else if (has_close_obstacles) {
         mode_ = ControlMode::CAREFUL;
-        v_max_total_ = 0.4;
+        current_v_max_total = 0.4; //
         v_ref_ = 0.3;
         weight_acceleration_ = 0.1;
         display_text_ = "CAREFUL";
     } else {
         mode_ = ControlMode::OBSTACLE;
-        v_max_total_ = 0.7;
+        current_v_max_total = 0.7; //
         v_ref_ = 0.5;
         weight_acceleration_ = 0.1;
         display_text_ = "OBSTACLE";
     }
     
-    // Check if reversal is needed (only in CAREFUL mode, similar to Python)
+    // Handle Reversal Mode Logic
     reverse_mode_ = false;
     std::vector<double> effective_theta_ref = theta_ref;
     
@@ -322,44 +341,126 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
         display_text_ = "REVERSING";
-        ROS_INFO("Reversal mode activated");
+        ROS_INFO_THROTTLE(1.0, "Reversal mode activated");
     }
+
+    // =========================================================================
+    // 3. UPDATE CONSTRAINT BOUNDS (v_max_total)
+    // =========================================================================
+    // We must update the "lh" and "uh" arrays to enforce the new v_max_total.
+    // The h vector is defined as: [ (vr+vl), omega, dist_L_sq, dist_R_sq ]
     
-    // Set reference trajectory for each stage
+    double lin_vel_bound = 2.0 * current_v_max_total; // vr + vl = 2*v
+    double ang_vel_bound = 0.8;                       // w_max
+    double dist_bound = 0.37 * 0.37;                  // min_dist_sq
+    
+    // Construct the bounds arrays (Size 4)
+    double lh[4] = {-lin_vel_bound, -ang_vel_bound, dist_bound, dist_bound};
+    double uh[4] = {lin_vel_bound, ang_vel_bound, 1.0e9, 1.0e9};
+
+    // Update bounds for stages 0 to N-1
     for (int i = 0; i < N_; ++i) {
+        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
+        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
+    }
+
+    // =========================================================================
+    // 4. UPDATE COST WEIGHTS (W Matrix)
+    // =========================================================================
+    // The W matrix is (nx + nu) x (nx + nu). For this robot: 5 + 2 = 7x7.
+    int ny = nx_ + nu_;
+    std::vector<double> W(ny * ny, 0.0);
+    
+    // Fill the diagonal.
+    // Index mapping: 0:x, 1:y, 2:theta, 3:vr, 4:vl, 5:ar, 6:al
+    W[0 * ny + 0] = weight_position_error_;
+    W[1 * ny + 1] = weight_position_error_;
+    W[2 * ny + 2] = 1.0;                    
+    W[3 * ny + 3] = weight_velocity_ref_;   
+    W[4 * ny + 4] = weight_velocity_ref_;   
+    W[5 * ny + 5] = weight_acceleration_;   // Dynamic!
+    W[6 * ny + 6] = weight_acceleration_;   // Dynamic!
+    
+    for (int i = 0; i < N_; ++i) {
+        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
+    }
+
+    // =========================================================================
+    // 5. PER-STAGE UPDATE: REFERENCE & INDEPENDENT OBSTACLES
+    // =========================================================================
+    double search_radius_sq = 2.5 * 2.5; 
+
+    for (int i = 0; i <= N_; ++i) {
+        // --- A. GET REFERENCE POINT FOR THIS STAGE ---
         int ref_idx = std::min(i, static_cast<int>(x_ref.size()) - 1);
         int theta_ref_idx = std::min(i, static_cast<int>(effective_theta_ref.size()) - 1);
         
-        // Reference state: [x, y, theta, vr, vl]
-        // In reverse mode, use negative reference velocity
-        double v_des = reverse_mode_ ? -v_ref_ : v_ref_;
-        double vr_ref = v_des;
-        double vl_ref = v_des;
+        double stage_x = x_ref[ref_idx];
+        double stage_y = y_ref[ref_idx];
+        double stage_theta = effective_theta_ref[theta_ref_idx];
+
+        // --- B. SET COST REFERENCE (yref) ---
+        if (i < N_) {
+            double v_des = reverse_mode_ ? -v_ref_ : v_ref_;
+            double y_ref_stage[7];
+            y_ref_stage[0] = stage_x;
+            y_ref_stage[1] = stage_y;
+            y_ref_stage[2] = stage_theta;
+            y_ref_stage[3] = v_des;
+            y_ref_stage[4] = v_des;
+            y_ref_stage[5] = 0.0;
+            y_ref_stage[6] = 0.0;
+            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
+        } else {
+            double y_ref_e[5];
+            y_ref_e[0] = stage_x;
+            y_ref_e[1] = stage_y;
+            y_ref_e[2] = stage_theta;
+            y_ref_e[3] = 0.0;
+            y_ref_e[4] = 0.0;
+            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
+        }
+
+        // --- C. FIND CLOSEST LEFT & RIGHT OBSTACLES ---
+        std::vector<double> obs_L = {1000.0, 1000.0}; 
+        std::vector<double> obs_R = {1000.0, 1000.0}; 
+        double min_dist_L = std::numeric_limits<double>::max();
+        double min_dist_R = std::numeric_limits<double>::max();
+
+        if (!obs_x.empty()) {
+            for(size_t j = 0; j < obs_x.size(); ++j) {
+                double d2 = std::pow(obs_x[j] - stage_x, 2) + std::pow(obs_y[j] - stage_y, 2);
+                if (d2 > search_radius_sq) continue;
+                
+                if (isLeft(stage_x, stage_y, stage_theta, obs_x[j], obs_y[j])) {
+                    if (d2 < min_dist_L) {
+                        min_dist_L = d2;
+                        obs_L[0] = obs_x[j];
+                        obs_L[1] = obs_y[j];
+                    }
+                } else {
+                    if (d2 < min_dist_R) {
+                        min_dist_R = d2;
+                        obs_R[0] = obs_x[j];
+                        obs_R[1] = obs_y[j];
+                    }
+                }
+            }
+        }
+
+        // --- D. UPDATE ACADOS PARAMETERS ---
+        double p_data[4];
+        p_data[0] = obs_L[0];
+        p_data[1] = obs_L[1];
+        p_data[2] = obs_R[0];
+        p_data[3] = obs_R[1];
         
-        double y_ref_stage[7];  // nx + nu = 5 + 2
-        y_ref_stage[0] = x_ref[ref_idx];
-        y_ref_stage[1] = y_ref[ref_idx];
-        y_ref_stage[2] = effective_theta_ref[theta_ref_idx];
-        y_ref_stage[3] = vr_ref;
-        y_ref_stage[4] = vl_ref;
-        y_ref_stage[5] = 0.0;  // ar reference (0)
-        y_ref_stage[6] = 0.0;  // al reference (0)
-        
-        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
+        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
     }
     
-    // Set terminal reference
-    int terminal_idx = std::min(N_ - 1, static_cast<int>(x_ref.size()) - 1);
-    int terminal_theta_idx = std::min(N_ - 1, static_cast<int>(effective_theta_ref.size()) - 1);
-    double y_ref_e[5];  // nx
-    y_ref_e[0] = x_ref[terminal_idx];
-    y_ref_e[1] = y_ref[terminal_idx];
-    y_ref_e[2] = effective_theta_ref[terminal_theta_idx];
-    y_ref_e[3] = 0.0;
-    y_ref_e[4] = 0.0;
-    ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
-    
-    // Solve OCP
+    // =========================================================================
+    // 6. SOLVE
+    // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
     
     if (status != 0) {
@@ -367,21 +468,20 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         return false;
     }
     
-    // Get optimal control from stage 0 (first control to apply)
+    // =========================================================================
+    // 7. EXTRACT SOLUTION
+    // =========================================================================
     double u_opt[2];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_opt);
     
-    // Get predicted state at stage 1 for the resulting wheel velocities
     double x_opt[5];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 1, "x", x_opt);
     
     double vr_opt = x_opt[3];
     double vl_opt = x_opt[4];
-    
     v_opt_ = (vr_opt + vl_opt) / 2.0;
     w_opt_ = (vr_opt - vl_opt) / WHEELBASE;
     
-    // Store solution for visualization
     std::vector<double> x_traj, y_traj;
     for (int i = 0; i < N_; ++i) {
         double x_stage[5];

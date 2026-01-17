@@ -93,6 +93,7 @@ private:
                          const std::vector<double>& y_ref,
                          double curr_x, double curr_y,
                          int& min_idx);
+    bool isLeft(double rx, double ry, double rtheta, double ox, double oy);
     
     // Reversal detection and handling
     bool checkReversalNeeded(const std::vector<double>& theta_ref,
