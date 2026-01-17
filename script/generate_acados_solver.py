@@ -70,12 +70,27 @@ def setup_acados_ocp():
     model, L = export_robot_model()
     ocp.model = model
     
+    # Closest left & right obs pos
+    p_obs_L = SX.sym('p_obs_L', 2) 
+    p_obs_R = SX.sym('p_obs_R', 2)
+
+    ocp.model.p = vertcat(p_obs_L, p_obs_R)
+    
+    # Initialize with "ghost" values far away (effectively no constraint)
+    ocp.parameter_values = np.array([1000.0, 1000.0, 1000.0, 1000.0])
+	
+    min_dist_sq = 0.37**2  # TODO: hardcoded Safety distance squared
+    x_state = ocp.model.x[0]
+    y_state = ocp.model.x[1]
+
+    dist_L_sq = (x_state - p_obs_L[0])**2 + (y_state - p_obs_L[1])**2
+    dist_R_sq = (x_state - p_obs_R[0])**2 + (y_state - p_obs_R[1])**2
+	
     # Dimensions
     nx = 5  # state dimension
     nu = 2  # control dimension
     N = 25  # prediction horizon (increased for better planning)
     
-    # Time horizon (2.5s with N=25 gives dt=0.1s per step)
     Tf = 2.5  # [s]
     ocp.solver_options.tf = Tf
     
@@ -126,15 +141,33 @@ def setup_acados_ocp():
     v_max_total = 0.8
     w_max = 0.8
     
-    from casadi import SX, vertcat
     x = model.x
     h_expr = vertcat(
         x[3] + x[4],  # vr + vl
-        (x[3] - x[4]) / L  # omega
+        (x[3] - x[4]) / L,  # omega
+        dist_L_sq,
+        dist_R_sq
     )
     ocp.model.con_h_expr = h_expr
-    ocp.constraints.lh = np.array([-2*v_max_total, -w_max])
-    ocp.constraints.uh = np.array([2*v_max_total, w_max])
+    ocp.constraints.lh = np.array([-2*v_max_total, -w_max, min_dist_sq, min_dist_sq])
+    ocp.constraints.uh = np.array([2*v_max_total, w_max, 1e9, 1e9])
+
+    # SOFT CONSTRAINTS
+    # Indices 2 and 3 correspond to dist_L_sq and dist_R_sq in h_expr
+    ocp.constraints.idxsh = np.array([2, 3])
+
+    # Soft constraint Penalty Weight
+    slack_weight = 1000.0
+
+    ns = 2 # Number of soft constraints
+
+    # Lower bound slack weights (Used when dist < min_dist)
+    ocp.cost.zl = slack_weight * np.ones(ns)
+    ocp.cost.Zl = slack_weight * np.ones(ns)
+
+    # Upper bound slack weights (Required by ACADOS structure, unused for distance)
+    ocp.cost.zu = np.zeros(ns)
+    ocp.cost.Zu = np.zeros(ns)
     
     # Initial state constraint (will be set online)
     ocp.constraints.x0 = np.zeros(nx)
