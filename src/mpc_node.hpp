@@ -14,6 +14,7 @@
 #include <string>
 #include <cmath>
 #include <memory>
+#include <mutex>
 
 // ACADOS interface
 extern "C" {
@@ -47,6 +48,9 @@ private:
     ros::Publisher pub_vel_;
     ros::Publisher pub_mpc_plan_;
     ros::Publisher pub_marker_;
+
+    // Mutex for solver
+    std::mutex solver_mutex_;
     
     // Subscribers
     ros::Subscriber sub_odom_;

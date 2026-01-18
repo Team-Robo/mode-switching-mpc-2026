@@ -31,6 +31,9 @@ def export_robot_model():
     
     control = vertcat(ar, al)
     
+    # Parameters: [xL, yL, xR, yR] - obstacle positions
+    p = SX.sym('p', 4)
+    
     # Differential drive dynamics
     v = (vr + vl) / 2  # linear velocity
     omega = (vr - vl) / L  # angular velocity
@@ -47,8 +50,22 @@ def export_robot_model():
     # State derivative symbolic variable
     x_dot = SX.sym('x_dot', 5)
     
+    # Distance constraints using parameters
+    p_obs_L = p[0:2]
+    p_obs_R = p[2:4]
+    dist_L_sq = (x - p_obs_L[0])**2 + (y - p_obs_L[1])**2
+    dist_R_sq = (x - p_obs_R[0])**2 + (y - p_obs_R[1])**2
+    
     # Implicit dynamics: f_impl = x_dot - f(x, u)
     f_impl = x_dot - f_expl
+    
+    # Nonlinear constraint expressions
+    h_expr = vertcat(
+        vr + vl,                   # total velocity constraint
+        (vr - vl) / L,             # angular velocity constraint
+        dist_L_sq,                 # left obstacle distance squared
+        dist_R_sq                  # right obstacle distance squared
+    )
     
     # Create ACADOS model
     model = AcadosModel()
@@ -56,8 +73,10 @@ def export_robot_model():
     model.x = state
     model.xdot = x_dot
     model.u = control
+    model.p = p  # Add parameters to model
     model.f_impl_expr = f_impl
     model.f_expl_expr = f_expl
+    model.con_h_expr = h_expr  # Nonlinear constraints
     
     return model, L
 
@@ -70,22 +89,12 @@ def setup_acados_ocp():
     model, L = export_robot_model()
     ocp.model = model
     
-    # Closest left & right obs pos
-    p_obs_L = SX.sym('p_obs_L', 2) 
-    p_obs_R = SX.sym('p_obs_R', 2)
-
-    ocp.model.p = vertcat(p_obs_L, p_obs_R)
+    # Parameter dimensions
+    ocp.dims.np = 4  # Number of parameters
     
-    # Initialize with "ghost" values far away (effectively no constraint)
+    # Initialize parameters with "ghost" values far away
     ocp.parameter_values = np.array([1000.0, 1000.0, 1000.0, 1000.0])
-	
-    min_dist_sq = 0.37**2  # TODO: hardcoded Safety distance squared
-    x_state = ocp.model.x[0]
-    y_state = ocp.model.x[1]
-
-    dist_L_sq = (x_state - p_obs_L[0])**2 + (y_state - p_obs_L[1])**2
-    dist_R_sq = (x_state - p_obs_R[0])**2 + (y_state - p_obs_R[1])**2
-	
+    
     # Dimensions
     nx = 5  # state dimension
     nu = 2  # control dimension
@@ -140,15 +149,10 @@ def setup_acados_ocp():
     # omega = (vr - vl) / L should be in [w_min, w_max]
     v_max_total = 0.8
     w_max = 0.8
+    min_dist_sq = 0.37**2
     
-    x = model.x
-    h_expr = vertcat(
-        x[3] + x[4],  # vr + vl
-        (x[3] - x[4]) / L,  # omega
-        dist_L_sq,
-        dist_R_sq
-    )
-    ocp.model.con_h_expr = h_expr
+    # NOTE: h_expr is already defined in the model
+    
     ocp.constraints.lh = np.array([-2*v_max_total, -w_max, min_dist_sq, min_dist_sq])
     ocp.constraints.uh = np.array([2*v_max_total, w_max, 1e9, 1e9])
 
@@ -160,6 +164,7 @@ def setup_acados_ocp():
     slack_weight = 1000.0
 
     ns = 2 # Number of soft constraints
+    ocp.constraints.ns = ns
 
     # Lower bound slack weights (Used when dist < min_dist)
     ocp.cost.zl = slack_weight * np.ones(ns)

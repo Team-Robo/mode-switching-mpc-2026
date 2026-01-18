@@ -19,6 +19,19 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
       weight_velocity_ref_(0.1), weight_position_error_(5.0),
       weight_acceleration_(1.0), v_ref_(0.8) {
     
+    // Load parameters from parameter server
+    nh_private_.param<int>("N", N_, 25);
+    nh_private_.param<double>("rate", rate_, 20.0);
+    nh_private_.param<double>("v_max_indiv", v_max_indiv_, 1.0);
+    nh_private_.param<double>("v_max_total", v_max_total_, 1.0);
+    nh_private_.param<double>("a_max", a_max_, 1.0);
+    
+    v_min_indiv_ = -v_max_indiv_;
+    v_min_total_ = -v_max_total_;
+    
+    ROS_INFO("MPC Parameters: N=%d, rate=%.1f Hz, v_max_total=%.2f, v_max_indiv=%.2f, a_max=%.2f",
+             N_, rate_, v_max_total_, v_max_indiv_, a_max_);
+    
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
@@ -314,20 +327,20 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // Update logic based on obstacles
     if (obs_x.empty()) {
         mode_ = ControlMode::SAFE;
-        current_v_max_total = 0.8; //
-        v_ref_ = 0.8;
+        current_v_max_total = v_max_total_;
+        v_ref_ = v_max_total_;
         weight_acceleration_ = 1.0;
         display_text_ = "SAFE";
     } else if (has_close_obstacles) {
         mode_ = ControlMode::CAREFUL;
-        current_v_max_total = 0.4; //
-        v_ref_ = 0.3;
+        current_v_max_total = v_max_total_ * 0.5;  // 50% of max for careful mode
+        v_ref_ = v_max_total_ * 0.375;  // 37.5% of max
         weight_acceleration_ = 0.1;
         display_text_ = "CAREFUL";
     } else {
         mode_ = ControlMode::OBSTACLE;
-        current_v_max_total = 0.7; //
-        v_ref_ = 0.5;
+        current_v_max_total = v_max_total_ * 0.875;  // 87.5% of max for obstacle mode
+        v_ref_ = v_max_total_ * 0.625;  // 62.5% of max
         weight_acceleration_ = 0.1;
         display_text_ = "OBSTACLE";
     }
@@ -455,7 +468,11 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         p_data[2] = obs_R[0];
         p_data[3] = obs_R[1];
         
-        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        // Use the correct function for parameter update
+        // Check if parameters exist first
+        if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0) {
+            jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        }
     }
     
     // =========================================================================
@@ -569,6 +586,7 @@ void MPCNode::publishMarker() {
 }
 
 void MPCNode::run() {
+    std::lock_guard<std::mutex> lock(solver_mutex_);
     try {
         // Find closest point on reference trajectory
         if (og_x_ref_.empty() || theta_ref_.empty()) {
@@ -633,10 +651,13 @@ int main(int argc, char** argv) {
     
     mpc_controller::MPCNode mpc_node(nh, nh_private);
     
-    ros::Rate rate(20);  // 20 Hz
+    // Get rate from private node handle
+    double control_rate;
+    nh_private.param<double>("rate", control_rate, 20.0);
+    ros::Rate rate(control_rate);
     ros::Duration(1.0).sleep();  // Initial sleep
     
-    ROS_INFO("Non-Linear MPC Node running with ACADOS (N=25, 20Hz)");
+    ROS_INFO("Non-Linear MPC Node running with ACADOS");
     
     while (ros::ok()) {
         ros::spinOnce();
