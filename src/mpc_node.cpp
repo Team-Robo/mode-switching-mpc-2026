@@ -9,7 +9,7 @@ namespace mpc_controller {
 MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private),
       acados_ocp_capsule_(nullptr),
-      N_(25), nx_(5), nu_(2), rate_(20.0),
+      N_(25), nx_(5), nu_(2), rate_(22.5),
       v_max_indiv_(1.0), v_min_indiv_(-1.0),
       v_max_total_(1.0), v_min_total_(-1.0),
       a_max_(1.0), w_max_(0.8), w_min_(-0.8),
@@ -21,10 +21,10 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     // Load parameters from parameter server
     nh_private_.param<int>("N", N_, 25);
-    nh_private_.param<double>("rate", rate_, 20.0);
-    nh_private_.param<double>("v_max_indiv", v_max_indiv_, 1.0);
-    nh_private_.param<double>("v_max_total", v_max_total_, 1.0);
-    nh_private_.param<double>("a_max", a_max_, 1.0);
+    nh_private_.param<double>("rate", rate_, 22.5);
+    nh_private_.param<double>("v_max_indiv", v_max_indiv_, 1.2);
+    nh_private_.param<double>("v_max_total", v_max_total_, 1.6);
+    nh_private_.param<double>("a_max", a_max_, 1.2);
     
     v_min_indiv_ = -v_max_indiv_;
     v_min_total_ = -v_max_total_;
