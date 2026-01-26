@@ -55,19 +55,17 @@ private:
     // Subscribers
     ros::Subscriber sub_odom_;
     ros::Subscriber sub_global_plan_;
-    ros::Subscriber sub_local_plan_;
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
     void callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg);
-    void callbackLocalPlan(const nav_msgs::Path::ConstPtr& msg);
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     
     // MPC solver
-    jackal_diff_drive_solver_capsule* acados_ocp_capsule_;
+    jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
     ocp_nlp_config* nlp_config_;
     ocp_nlp_dims* nlp_dims_;
     ocp_nlp_in* nlp_in_;
@@ -78,6 +76,7 @@ private:
     // Helper functions
     void initializeAcadosSolver();
     void cleanupAcadosSolver();
+    
     bool solveOCP(const std::vector<double>& x_ref,
                   const std::vector<double>& y_ref,
                   const std::vector<double>& theta_ref,
@@ -108,23 +107,19 @@ private:
     
     // Robot parameters
     static constexpr double WHEELBASE = 0.37558;  // Distance between wheels [m]
-    static constexpr double COLLISION_DIST = 0.37;
-    static constexpr double SAFE_DISTANCE = 0.5;
+    double SAFE_DISTANCE = 0.5;
     
     // Velocity limits
-    double v_max_indiv_;
-    double v_min_indiv_;
-    double v_max_total_;
-    double v_min_total_;
-    double a_max_;
-    double w_max_;
-    double w_min_;
+    double v_max_total_ = 1.0;
+    double v_min_total_ = -1.0;
+    double a_max_ = 1.0;
+    double w_max_ = 0.8;
+    double w_min_ = -0.8;
     
     // MPC parameters
-    int N_;  // Prediction horizon
-    int nx_;  // State dimension (5: x, y, theta, vr, vl)
-    int nu_;  // Control dimension (2: ar, al)
-    double rate_;  // Control frequency [Hz]
+    int N_ = 25;  // Prediction horizon
+    int nx_ = 5;  // State dimension (5: x, y, theta, vr, vl)
+    int nu_ = 2;  // Control dimension (2: ar, al)
     
     // Current state [x, y, theta, vr, vl]
     std::vector<double> current_state_;
@@ -142,26 +137,31 @@ private:
     std::vector<double> map_x_;
     std::vector<double> map_y_;
     
+
     // Control mode
-    ControlMode mode_;
+    ControlMode mode_ = ControlMode::SAFE;
     std::string display_text_;
     
     // Optimal controls
-    double v_opt_;
-    double w_opt_;
+    double v_opt_ = 0.0; // Linear velocity
+    double w_opt_ = 0.0; // Angular velocity
     
     // Reversal state
-    bool reverse_mode_;
+    bool reverse_mode_ = false;
     std::vector<double> reverse_theta_ref_;
     
     // Previous solution for warm start
     std::vector<double> previous_solution_;
     
     // Cost weights
-    double weight_velocity_ref_;
-    double weight_position_error_;
-    double weight_acceleration_;
-    double v_ref_;
+    double weight_velocity_ref_ = 0.1;
+    double weight_position_error_ = 5.0;
+    double weight_acceleration_ = 1.0;
+    double v_ref_ = 0.8;
+
+    double reversa_alpha = 0.7;
+    double obs_search_radius_ = 3.0;
+    double min_obstacle_distance_ = 0.2;
 };
 
 } // namespace mpc_controller

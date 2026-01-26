@@ -9,10 +9,10 @@
             command="load" ns="local_costmap" />
 
         <rosparam
-            file="$(find jackal_helper)/configs/params/odom_nav_params/global_costmap_params.yaml"
+            file="$(find jackal_helper)/configs/params/odom_nav_params/global_costmap_params_mpc_tuned.yaml"
             command="load" />
         <rosparam
-            file="$(find jackal_helper)/configs/params/odom_nav_params/local_costmap_params.yaml"
+            file="$(find jackal_helper)/configs/params/odom_nav_params/local_costmap_params_mpc_tuned.yaml"
             command="load" />
 
         <rosparam file="$(find jackal_helper)/configs/params/base_local_planner_params.yaml"

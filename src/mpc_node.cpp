@@ -7,30 +7,17 @@
 namespace mpc_controller {
 
 MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
-    : nh_(nh), nh_private_(nh_private),
-      acados_ocp_capsule_(nullptr),
-      N_(25), nx_(5), nu_(2), rate_(22.5),
-      v_max_indiv_(1.0), v_min_indiv_(-1.0),
-      v_max_total_(1.0), v_min_total_(-1.0),
-      a_max_(1.0), w_max_(0.8), w_min_(-0.8),
-      mode_(ControlMode::SAFE),
-      v_opt_(0.0), w_opt_(0.0),
-      reverse_mode_(false),
-      weight_velocity_ref_(0.1), weight_position_error_(5.0),
-      weight_acceleration_(1.0), v_ref_(0.8) {
+    : nh_(nh), nh_private_(nh_private) {
     
     // Load parameters from parameter server
-    nh_private_.param<int>("N", N_, 25);
-    nh_private_.param<double>("rate", rate_, 22.5);
-    nh_private_.param<double>("v_max_indiv", v_max_indiv_, 1.2);
-    nh_private_.param<double>("v_max_total", v_max_total_, 1.6);
-    nh_private_.param<double>("a_max", a_max_, 1.2);
+    // nh_private_.param<int>("N", N_, 25); // not applied
+    nh_private_.param<double>("v_max_total", v_max_total_, 1.5); // applied
+    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.7); // applied
+    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 2.0); // applied
+    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.2); // applied
     
-    v_min_indiv_ = -v_max_indiv_;
-    v_min_total_ = -v_max_total_;
-    
-    ROS_INFO("MPC Parameters: N=%d, rate=%.1f Hz, v_max_total=%.2f, v_max_indiv=%.2f, a_max=%.2f",
-             N_, rate_, v_max_total_, v_max_indiv_, a_max_);
+    ROS_INFO("MPC Parameters: N=%d, v_max_total=%.2f",
+             N_, v_max_total_);
     
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
@@ -41,8 +28,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     sub_odom_ = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
     sub_global_plan_ = nh_.subscribe("/move_base/TrajectoryPlannerROS/global_plan", 1, 
                                      &MPCNode::callbackGlobalPlan, this);
-    sub_local_plan_ = nh_.subscribe("/move_base/TrajectoryPlannerROS/local_plan", 1,
-                                    &MPCNode::callbackLocalPlan, this);
+
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
     
@@ -145,10 +131,6 @@ void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
         }
         center_heading = theta_proc;
     }
-}
-
-void MPCNode::callbackLocalPlan(const nav_msgs::Path::ConstPtr& msg) {
-    // Optional: process local plan if needed
 }
 
 void MPCNode::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
@@ -349,7 +331,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     reverse_mode_ = false;
     std::vector<double> effective_theta_ref = theta_ref;
     
-    if (mode_ == ControlMode::CAREFUL && checkReversalNeeded(theta_ref, current_state[2])) {
+    if ((mode_ == ControlMode::CAREFUL || mode_ == ControlMode::OBSTACLE)  && checkReversalNeeded(theta_ref, current_state[2])) {
         reverse_mode_ = true;
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
@@ -365,7 +347,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     
     double lin_vel_bound = 2.0 * current_v_max_total; // vr + vl = 2*v
     double ang_vel_bound = 0.8;                       // w_max
-    double dist_bound = 0.37 * 0.37;                  // min_dist_sq
+    double dist_bound = min_obstacle_distance_ * min_obstacle_distance_; // min_dist_sq
     
     // Construct the bounds arrays (Size 4)
     double lh[4] = {-lin_vel_bound, -ang_vel_bound, dist_bound, dist_bound};
@@ -401,7 +383,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 5. PER-STAGE UPDATE: REFERENCE & INDEPENDENT OBSTACLES
     // =========================================================================
-    double search_radius_sq = 2.5 * 2.5; 
+    double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
     for (int i = 0; i <= N_; ++i) {
         // --- A. GET REFERENCE POINT FOR THIS STAGE ---
@@ -414,7 +396,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
         // --- B. SET COST REFERENCE (yref) ---
         if (i < N_) {
-            double v_des = reverse_mode_ ? -v_ref_ : v_ref_;
+            double v_des = reverse_mode_ ? (-v_ref_ * reversa_alpha) : v_ref_;
             double y_ref_stage[7];
             y_ref_stage[0] = stage_x;
             y_ref_stage[1] = stage_y;
@@ -607,15 +589,30 @@ void MPCNode::run() {
         
         // Check if we have enough reference points
         if (x_ref_.size() <= static_cast<size_t>(N_)) {
-            ROS_INFO("Stopped: insufficient reference points (%zu)", x_ref_.size());
-            publishVelocity(0.0, 0.0);
-            return;
+            if (x_ref_.empty()) {
+                publishVelocity(0.0, 0.0);
+                return;
+            }
+            
+            // Pad with the goal point
+            double goal_x = x_ref_.back();
+            double goal_y = y_ref_.back();
+            while (x_ref_.size() <= static_cast<size_t>(N_)) {
+                x_ref_.push_back(goal_x);
+                y_ref_.push_back(goal_y);
+            }
+            ROS_INFO("Extended path to goal: %zu points", x_ref_.size());
         }
         
         // Prepare theta reference from closest point
         std::vector<double> theta_ref_subset;
         for (size_t i = min_idx; i < theta_ref_.size(); ++i) {
             theta_ref_subset.push_back(theta_ref_[i]);
+        }
+
+        // Pad theta if needed
+        while (theta_ref_subset.size() < x_ref_.size()) {
+            theta_ref_subset.push_back(theta_ref_subset.back());
         }
         
         // Combine obstacles
@@ -650,12 +647,11 @@ int main(int argc, char** argv) {
     ros::NodeHandle nh_private("~");
     
     mpc_controller::MPCNode mpc_node(nh, nh_private);
-    
-    // Get rate from private node handle
-    double control_rate;
-    nh_private.param<double>("rate", control_rate, 20.0);
-    ros::Rate rate(control_rate);
-    ros::Duration(1.0).sleep();  // Initial sleep
+
+    double mpc_rate_;
+    nh_private.param<double>("mpc_rate", mpc_rate_, 20.0); // applied
+    ros::Rate rate(mpc_rate_);
+    ros::Duration(1.0).sleep();
     
     ROS_INFO("Non-Linear MPC Node running with ACADOS");
     

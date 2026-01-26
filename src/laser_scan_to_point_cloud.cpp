@@ -5,60 +5,73 @@
 #include <laser_geometry/laser_geometry.h>
 #include <tf/transform_listener.h>
 #include <cmath>
+#include <mutex>
 
 class LaserScanToPointCloud {
 private:
-    const double DETECTED = 1.0;
     const int SCAN_SPACING = 15;
     const std::string TOPIC_LASER_SCAN = "/front/scan";
     const std::string TOPIC_POINT_CLOUD_LASER = "/front/laser/cloud";
     const std::string TOPIC_POINT_CLOUD_ODOM = "/front/odom/cloud";
+    const double TF_TIMEOUT = 0.1; // 100ms timeout for TF lookups
     
     sensor_msgs::LaserScan laser_scan;
     sensor_msgs::PointCloud2 point_cloud;
     laser_geometry::LaserProjection laser_projector;
     
     ros::Subscriber sub_laser_scan;
-    ros::Publisher pub_point_cloud_laser;
     ros::Publisher pub_point_cloud_odom;
     
     tf::TransformListener tf_listener;
+    std::mutex cloud_mutex_;
+    bool has_new_data_;
     
 public:
-    LaserScanToPointCloud(ros::NodeHandle& nh) {
+    LaserScanToPointCloud(ros::NodeHandle& nh) : has_new_data_(false) {
         sub_laser_scan = nh.subscribe(TOPIC_LASER_SCAN, 1, 
                                       &LaserScanToPointCloud::callbackLaserScan, this);
-        pub_point_cloud_laser = nh.advertise<sensor_msgs::PointCloud2>(
-                                      TOPIC_POINT_CLOUD_LASER, 1);
         pub_point_cloud_odom = nh.advertise<sensor_msgs::PointCloud2>(
                                       TOPIC_POINT_CLOUD_ODOM, 1);
     }
     
     void callbackLaserScan(const sensor_msgs::LaserScan::ConstPtr& msg) {
+        std::lock_guard<std::mutex> lock(cloud_mutex_);
         laser_scan = *msg;
         laser_projector.projectLaser(*msg, point_cloud);
-        pub_point_cloud_laser.publish(point_cloud);
+        has_new_data_ = true;
     }
     
     void run() {
-        if (point_cloud.width == 0) {
-            return;  // No point cloud data yet
-        }
+        std::lock_guard<std::mutex> lock(cloud_mutex_);
         
-        tf::StampedTransform transform;
-        try {
-            tf_listener.lookupTransform("/odom", "/front_laser", ros::Time(0), transform);
-        } catch (tf::TransformException& ex) {
-            ROS_ERROR("%s", ex.what());
+        // Only process if we have new data
+        if (!has_new_data_ || point_cloud.width == 0) {
             return;
         }
         
-        // Get transform components
-        tf::Vector3 trans = transform.getOrigin();
-        tf::Quaternion rot = transform.getRotation();
+        tf::StampedTransform transform;
         
-        // Create rotation matrix from quaternion
-        tf::Matrix3x3 rot_matrix(rot);
+        try {
+            // Strategy 1: Try the exact timestamp first
+            tf_listener.lookupTransform("/odom", "/front_laser", 
+                                       point_cloud.header.stamp, transform);
+        } catch (tf::TransformException& ex) {
+            try {
+                // Strategy 2: Use the latest available transform (time 0)
+                // This is more robust and prevents extrapolation errors
+                tf_listener.lookupTransform("/odom", "/front_laser", 
+                                           ros::Time(0), transform);
+                
+                // Update the point cloud timestamp to match the transform
+                // This keeps things consistent
+                point_cloud.header.stamp = transform.stamp_;
+                
+            } catch (tf::TransformException& ex2) {
+                // Only log occasionally to avoid spam
+                ROS_WARN_THROTTLE(2.0, "TF lookup failed: %s", ex2.what());
+                return;
+            }
+        }
         
         // Parse input point cloud
         sensor_msgs::PointCloud2ConstIterator<float> iter_x(point_cloud, "x");
@@ -68,7 +81,7 @@ public:
         // Create output point cloud
         sensor_msgs::PointCloud2 output_cloud;
         output_cloud.header.frame_id = "odom";
-        output_cloud.header.stamp = ros::Time::now();
+        output_cloud.header.stamp = point_cloud.header.stamp;
         output_cloud.height = 1;
         output_cloud.is_dense = false;
         output_cloud.is_bigendian = false;
@@ -91,16 +104,10 @@ public:
                 // Transform to odom frame
                 tf::Vector3 p_odom = transform * p_laser;
                 
-                // Calculate distance from robot
-                double dist_sq = std::pow(p_odom.x() - trans.x(), 2) + 
-                                std::pow(p_odom.y() - trans.y(), 2);
-                
-                if (dist_sq < DETECTED * DETECTED) {
-                    points_data.push_back(p_odom.x());
-                    points_data.push_back(p_odom.y());
-                    points_data.push_back(p_odom.z());
-                    points_data.push_back(1.0); // intensity
-                }
+                points_data.push_back(p_odom.x());
+                points_data.push_back(p_odom.y());
+                points_data.push_back(p_odom.z());
+                points_data.push_back(1.0); // intensity
             }
             count++;
         }
@@ -123,7 +130,9 @@ public:
         }
         
         pub_point_cloud_odom.publish(output_cloud);
-        ROS_INFO("Published %lu points", points_data.size() / 4);
+        has_new_data_ = false; // Mark as processed
+        
+        ROS_INFO_THROTTLE(2.0, "Published %lu points", points_data.size() / 4);
     }
 };
 
@@ -134,6 +143,8 @@ int main(int argc, char** argv) {
     ROS_INFO("Laser Scan to Point Cloud Node");
     
     LaserScanToPointCloud converter(nh);
+    
+    // Use a lower rate or make it event-driven
     ros::Rate rate(20);
     
     while (ros::ok()) {
