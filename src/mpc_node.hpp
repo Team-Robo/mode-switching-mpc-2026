@@ -107,14 +107,14 @@ private:
     
     // Robot parameters
     static constexpr double WHEELBASE = 0.37558;  // Distance between wheels [m]
-    double SAFE_DISTANCE = 0.5;
     
-    // Velocity limits
-    double v_max_total_ = 1.0;
-    double v_min_total_ = -1.0;
-    double a_max_ = 1.0;
-    double w_max_ = 0.8;
-    double w_min_ = -0.8;
+    // FIXED: Clearer variable names
+    double SAFE_DISTANCE = 1.75;  // Distance threshold to enter SAFE mode [m] - INCREASED DEFAULT
+    
+    // Velocity limits (absolute physical limits)
+    double v_linear_max_ = 2.0;  // RENAMED: Maximum linear velocity [m/s]
+    double omega_max_ = 0.8;     // Maximum angular velocity [rad/s]
+    double a_max_ = 1.0;         // Maximum acceleration [m/s^2]
     
     // MPC parameters
     int N_ = 25;  // Prediction horizon
@@ -137,7 +137,6 @@ private:
     std::vector<double> map_x_;
     std::vector<double> map_y_;
     
-
     // Control mode
     ControlMode mode_ = ControlMode::SAFE;
     std::string display_text_;
@@ -152,16 +151,16 @@ private:
     
     // Previous solution for warm start
     std::vector<double> previous_solution_;
-    
+
     // Cost weights
-    double weight_velocity_ref_ = 0.1;
+    double weight_velocity_ref_ = 2.5;
     double weight_position_error_ = 5.0;
     double weight_acceleration_ = 1.0;
-    double v_ref_ = 0.8;
 
-    double reversa_alpha = 0.7;
-    double obs_search_radius_ = 3.0;
-    double min_obstacle_distance_ = 0.2;
+    // Tuning parameters
+    double reversa_alpha = 0.7;           // Speed scaling for reverse mode
+    double obs_search_radius_ = 3.0;      // Radius to search for obstacles [m]
+    double min_obstacle_distance_ = 0.35;  // Minimum allowed distance to obstacles [m]
 };
 
 } // namespace mpc_controller
