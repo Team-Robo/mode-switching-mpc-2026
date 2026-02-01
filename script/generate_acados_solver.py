@@ -3,6 +3,10 @@
 ACADOS code generation script for differential drive MPC
 State: [x, y, theta, vr, vl] (5 states)
 Control: [ar, al] (2 controls - accelerations of right and left wheels)
+
+FIXED:
+- Velocity constraints now properly handle v_linear ∈ [-2, 2] m/s
+- Clearer variable naming
 """
 
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
@@ -60,9 +64,10 @@ def export_robot_model():
     f_impl = x_dot - f_expl
     
     # Nonlinear constraint expressions
+    # NOTE: v_linear = (vr + vl)/2, so to constrain v_linear we constrain (vr+vl)/2
     h_expr = vertcat(
-        vr + vl,                   # total velocity constraint
-        (vr - vl) / L,             # angular velocity constraint
+        (vr + vl) / 2.0,           # linear velocity constraint (v_linear)
+        (vr - vl) / L,             # angular velocity constraint (omega)
         dist_L_sq,                 # left obstacle distance squared
         dist_R_sq                  # right obstacle distance squared
     )
@@ -98,14 +103,14 @@ def setup_acados_ocp():
     # Dimensions
     nx = 5  # state dimension
     nu = 2  # control dimension
-    N = 25  # prediction horizon (increased for better planning)
+    N = 25  # prediction horizon
     
     Tf = 2.5  # [s]
     ocp.solver_options.tf = Tf
     
     # Cost matrices
     # Stage cost: weighted tracking error + control effort
-    Q = np.diag([5.0, 5.0, 1.0, 0.1, 0.1])  # state weights [x, y, theta, vr, vl]
+    Q = np.diag([5.0, 5.0, 1.0, 2.5, 2.5])  # state weights [x, y, theta, vr, vl]
     R = np.diag([1.0, 1.0])  # control weights [ar, al]
     
     # Terminal cost
@@ -136,25 +141,26 @@ def setup_acados_ocp():
     # Constraints
     # State constraints (only for vr and vl)
     ocp.constraints.idxbx = np.array([3, 4])  # constrain vr, vl
-    ocp.constraints.lbx = np.array([-1.0, -1.0])  # bounds only for indices in idxbx
-    ocp.constraints.ubx = np.array([1.0, 1.0])    # bounds only for indices in idxbx
+    ocp.constraints.lbx = np.array([-2.0, -2.0])  # individual wheel velocity bounds
+    ocp.constraints.ubx = np.array([2.0, 2.0])    # individual wheel velocity bounds
     
     # Control constraints
     ocp.constraints.lbu = np.array([-1.0, -1.0])  # min accelerations
     ocp.constraints.ubu = np.array([1.0, 1.0])    # max accelerations
     ocp.constraints.idxbu = np.array([0, 1])
     
-    # Nonlinear constraints for total velocity and angular velocity
-    # v_total = vr + vl should be in [-2*v_max, 2*v_max]
-    # omega = (vr - vl) / L should be in [w_min, w_max]
-    v_max_total = 0.8
-    w_max = 0.8
-    min_dist_sq = 0.37**2
+    # Nonlinear constraints
+    # h_expr = [(vr+vl)/2, (vr-vl)/L, dist_L_sq, dist_R_sq]
+    # Index 0: v_linear = (vr+vl)/2 ∈ [-2.0, 2.0] m/s
+    # Index 1: omega = (vr-vl)/L ∈ [-0.8, 0.8] rad/s
+    # Index 2,3: distance squared constraints
     
-    # NOTE: h_expr is already defined in the model
+    v_linear_max = 2.0  # Maximum linear velocity [m/s]
+    omega_max = 0.8     # Maximum angular velocity [rad/s]
+    min_dist_sq = 0.37**2  # Minimum distance squared to obstacles
     
-    ocp.constraints.lh = np.array([-2*v_max_total, -w_max, min_dist_sq, min_dist_sq])
-    ocp.constraints.uh = np.array([2*v_max_total, w_max, 1e9, 1e9])
+    ocp.constraints.lh = np.array([-v_linear_max, -omega_max, min_dist_sq, min_dist_sq])
+    ocp.constraints.uh = np.array([v_linear_max, omega_max, 1e9, 1e9])
 
     # SOFT CONSTRAINTS
     # Indices 2 and 3 correspond to dist_L_sq and dist_R_sq in h_expr
@@ -163,7 +169,7 @@ def setup_acados_ocp():
     # Soft constraint Penalty Weight
     slack_weight = 1000.0
 
-    ns = 2 # Number of soft constraints
+    ns = 2  # Number of soft constraints
     ocp.constraints.ns = ns
 
     # Lower bound slack weights (Used when dist < min_dist)
@@ -178,16 +184,16 @@ def setup_acados_ocp():
     ocp.constraints.x0 = np.zeros(nx)
     
     # Set dimensions
-    ocp.solver_options.N_horizon = N  # Use N_horizon instead of deprecated dims.N
+    ocp.solver_options.N_horizon = N
     
     # Solver options
     ocp.solver_options.qp_solver = 'PARTIAL_CONDENSING_HPIPM'
     ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
     ocp.solver_options.integrator_type = 'ERK'  # Explicit Runge-Kutta
-    ocp.solver_options.nlp_solver_type = 'SQP_RTI'  # Real-time iteration (best for i3 CPU)
+    ocp.solver_options.nlp_solver_type = 'SQP_RTI'  # Real-time iteration
     ocp.solver_options.nlp_solver_max_iter = 1  # RTI uses 1 iteration per call
-    ocp.solver_options.qp_solver_iter_max = 20  # Reduced for i3 CPU
-    ocp.solver_options.tol = 1e-3  # Slightly relaxed tolerance for speed
+    ocp.solver_options.qp_solver_iter_max = 20
+    ocp.solver_options.tol = 1e-3
     
     # Code generation options
     ocp.code_export_directory = 'c_generated_code'
@@ -204,10 +210,10 @@ def generate_solver():
     
     print("ACADOS solver code generated successfully!")
     print("Generated files in: c_generated_code/")
-    print("\nTo compile in your ROS package:")
-    print("1. Copy c_generated_code/ to your package")
-    print("2. Add ACADOS includes and libs to CMakeLists.txt")
-    print("3. Link against acados library")
+    print("\nVelocity constraints:")
+    print("  - Linear velocity: [-2.0, 2.0] m/s")
+    print("  - Angular velocity: [-0.8, 0.8] rad/s")
+    print("  - Individual wheel velocities: [-2.0, 2.0] m/s")
     
     return acados_ocp_solver
 

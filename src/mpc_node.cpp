@@ -10,14 +10,14 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private) {
     
     // Load parameters from parameter server
-    // nh_private_.param<int>("N", N_, 25); // not applied
-    nh_private_.param<double>("v_max_total", v_max_total_, 1.5); // applied
-    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.7); // applied
-    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 2.0); // applied
-    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.2); // applied
+    nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);  // max linear velocity [m/s]
+    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.55);
+    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.0);
+    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.35);
+    nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.75);  // INCREASED DEFAULT
     
-    ROS_INFO("MPC Parameters: N=%d, v_max_total=%.2f",
-             N_, v_max_total_);
+    ROS_INFO("MPC Parameters: N=%d, v_linear_max=%.2f m/s, SAFE_DISTANCE=%.2f m",
+             N_, v_linear_max_, SAFE_DISTANCE);
     
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
@@ -291,47 +291,64 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // 2. DETERMINE CONTROL MODE (SAFE / CAREFUL / OBSTACLE)
     // =========================================================================
     bool has_close_obstacles = false;
+    double closest_obstacle_dist = std::numeric_limits<double>::max();
+    
     if (!obs_x.empty()) {
         for (size_t i = 0; i < obs_x.size(); ++i) {
             double dx = obs_x[i] - current_state[0];
             double dy = obs_y[i] - current_state[1];
             double dist = std::sqrt(dx*dx + dy*dy);
+            
+            if (dist < closest_obstacle_dist) {
+                closest_obstacle_dist = dist;
+            }
+            
             if (dist < SAFE_DISTANCE) {
                 has_close_obstacles = true;
-                break;
             }
         }
     }
     
-    // Define max velocity variable for this iteration
-    double current_v_max_total = 0.8; // Default
-
-    // Update logic based on obstacles
-    if (obs_x.empty()) {
+    // FIXED: More intuitive mode selection logic
+    // Variables renamed for clarity:
+    // - v_linear_limit: the actual velocity constraint applied to the solver
+    // - v_target: the desired reference velocity for tracking
+    
+    double v_linear_limit;  // Velocity constraint for solver [m/s]
+    double v_target;        // Target velocity for cost function [m/s]
+    
+    if (!has_close_obstacles) {
+        // SAFE MODE: No obstacles within SAFE_DISTANCE
         mode_ = ControlMode::SAFE;
-        current_v_max_total = v_max_total_;
-        v_ref_ = v_max_total_;
+        v_linear_limit = v_linear_max_;           // Full speed: 2.0 m/s
+        v_target = v_linear_max_ * 0.85;          // Target: 1.5 m/s
         weight_acceleration_ = 1.0;
         display_text_ = "SAFE";
-    } else if (has_close_obstacles) {
+        ROS_INFO_THROTTLE(2.0, "Mode: SAFE (closest obs: %.2fm)", closest_obstacle_dist);
+    } else if (closest_obstacle_dist < SAFE_DISTANCE * 0.5) {
+        // CAREFUL MODE: Obstacles very close (within half of SAFE_DISTANCE)
         mode_ = ControlMode::CAREFUL;
-        current_v_max_total = v_max_total_ * 0.5;  // 50% of max for careful mode
-        v_ref_ = v_max_total_ * 0.375;  // 37.5% of max
+        v_linear_limit = v_linear_max_ * 0.5;     // Limit: 1.0 m/s
+        v_target = v_linear_max_ * 0.375;         // Target: 0.75 m/s
         weight_acceleration_ = 0.1;
         display_text_ = "CAREFUL";
+        ROS_WARN_THROTTLE(2.0, "Mode: CAREFUL (closest obs: %.2fm)", closest_obstacle_dist);
     } else {
+        // OBSTACLE MODE: Obstacles present but not very close
         mode_ = ControlMode::OBSTACLE;
-        current_v_max_total = v_max_total_ * 0.875;  // 87.5% of max for obstacle mode
-        v_ref_ = v_max_total_ * 0.625;  // 62.5% of max
+        v_linear_limit = v_linear_max_ * 0.85;    // Limit: 1.5 m/s
+        v_target = v_linear_max_ * 0.7;         // Target: 1.25 m/s
         weight_acceleration_ = 0.1;
         display_text_ = "OBSTACLE";
+        ROS_INFO_THROTTLE(2.0, "Mode: OBSTACLE (closest obs: %.2fm)", closest_obstacle_dist);
     }
     
     // Handle Reversal Mode Logic
     reverse_mode_ = false;
     std::vector<double> effective_theta_ref = theta_ref;
     
-    if ((mode_ == ControlMode::CAREFUL || mode_ == ControlMode::OBSTACLE)  && checkReversalNeeded(theta_ref, current_state[2])) {
+    if ((mode_ == ControlMode::CAREFUL || mode_ == ControlMode::OBSTACLE) && 
+        checkReversalNeeded(theta_ref, current_state[2])) {
         reverse_mode_ = true;
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
@@ -340,18 +357,18 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 3. UPDATE CONSTRAINT BOUNDS (v_max_total)
+    // 3. UPDATE CONSTRAINT BOUNDS
     // =========================================================================
-    // We must update the "lh" and "uh" arrays to enforce the new v_max_total.
-    // The h vector is defined as: [ (vr+vl), omega, dist_L_sq, dist_R_sq ]
+    // FIXED: Now correctly constrains v_linear (not vr+vl)
+    // h_expr = [(vr+vl)/2, (vr-vl)/L, dist_L_sq, dist_R_sq]
+    //          [v_linear,  omega,     dist_L,    dist_R   ]
     
-    double lin_vel_bound = 2.0 * current_v_max_total; // vr + vl = 2*v
-    double ang_vel_bound = 0.8;                       // w_max
-    double dist_bound = min_obstacle_distance_ * min_obstacle_distance_; // min_dist_sq
+    double omega_limit = 0.8;  // Angular velocity limit [rad/s]
+    double dist_bound = min_obstacle_distance_ * min_obstacle_distance_;
     
     // Construct the bounds arrays (Size 4)
-    double lh[4] = {-lin_vel_bound, -ang_vel_bound, dist_bound, dist_bound};
-    double uh[4] = {lin_vel_bound, ang_vel_bound, 1.0e9, 1.0e9};
+    double lh[4] = {-v_linear_limit, -omega_limit, dist_bound, dist_bound};
+    double uh[4] = {v_linear_limit, omega_limit, 1.0e9, 1.0e9};
 
     // Update bounds for stages 0 to N-1
     for (int i = 0; i < N_; ++i) {
@@ -396,13 +413,17 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
         // --- B. SET COST REFERENCE (yref) ---
         if (i < N_) {
-            double v_des = reverse_mode_ ? (-v_ref_ * reversa_alpha) : v_ref_;
+            // FIXED: Clearer velocity reference calculation
+            // Convert v_target to wheel velocities
+            double vr_target = reverse_mode_ ? (-v_target * reversa_alpha) : v_target;
+            double vl_target = vr_target;  // Both wheels same for straight motion
+            
             double y_ref_stage[7];
             y_ref_stage[0] = stage_x;
             y_ref_stage[1] = stage_y;
             y_ref_stage[2] = stage_theta;
-            y_ref_stage[3] = v_des;
-            y_ref_stage[4] = v_des;
+            y_ref_stage[3] = vr_target;
+            y_ref_stage[4] = vl_target;
             y_ref_stage[5] = 0.0;
             y_ref_stage[6] = 0.0;
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
@@ -451,7 +472,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         p_data[3] = obs_R[1];
         
         // Use the correct function for parameter update
-        // Check if parameters exist first
         if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0) {
             jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
         }
@@ -649,7 +669,7 @@ int main(int argc, char** argv) {
     mpc_controller::MPCNode mpc_node(nh, nh_private);
 
     double mpc_rate_;
-    nh_private.param<double>("mpc_rate", mpc_rate_, 20.0); // applied
+    nh_private.param<double>("mpc_rate", mpc_rate_, 30.0);
     ros::Rate rate(mpc_rate_);
     ros::Duration(1.0).sleep();
     
