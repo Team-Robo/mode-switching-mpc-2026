@@ -45,13 +45,13 @@ else()
         ${ACADOS_INSTALL_DIR}/include
         ${ACADOS_INSTALL_DIR}/include/blasfeo/include
         ${ACADOS_INSTALL_DIR}/include/hpipm/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/script/c_generated_code
+        ${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code
     )
     
     # ACADOS library directories
     set(ACADOS_LIBRARY_DIRS
         ${ACADOS_INSTALL_DIR}/lib
-        ${CMAKE_CURRENT_SOURCE_DIR}/script/c_generated_code
+        ${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code
     )
     
     # ACADOS libraries
@@ -150,16 +150,16 @@ if(ACADOS_INSTALL_DIR)
         src/mpc_node.cpp
     )
     
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/script/c_generated_code/acados_solver_jackal_diff_drive.c")
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code/acados_solver_jackal_diff_drive.c")
         # Build the ACADOS solver library from source
         add_library(acados_solver_lib STATIC
-            script/c_generated_code/acados_solver_jackal_diff_drive.c
-            script/c_generated_code/acados_sim_solver_jackal_diff_drive.c
-            script/c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_ode_fun.c
-            script/c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_forw.c
-            script/c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_adj.c
-            script/c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun.c
-            script/c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun_jac_uxt_zt.c
+            c_generated_code/acados_solver_jackal_diff_drive.c
+            c_generated_code/acados_sim_solver_jackal_diff_drive.c
+            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_ode_fun.c
+            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_forw.c
+            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_adj.c
+            c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun.c
+            c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun_jac_uxt_zt.c
         )
         target_include_directories(acados_solver_lib PUBLIC
             ${ACADOS_INCLUDE_DIRS}

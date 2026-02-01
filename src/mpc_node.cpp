@@ -10,14 +10,20 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private) {
     
     // Load parameters from parameter server
-    nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);  // max linear velocity [m/s]
-    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.55);
+    nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);
+    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.7);
     nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.0);
-    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.35);
-    nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.75);  // INCREASED DEFAULT
+    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.40);
+    nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.25);
+    
+    nh_private_.param<double>("weight_position_error", weight_position_error_, 50.0);
+    nh_private_.param<double>("weight_heading_error", weight_heading_error_, 20.0);
+    nh_private_.param<double>("weight_acceleration", weight_acceleration_, 0.0001);
     
     ROS_INFO("MPC Parameters: N=%d, v_linear_max=%.2f m/s, SAFE_DISTANCE=%.2f m",
              N_, v_linear_max_, SAFE_DISTANCE);
+    ROS_INFO("MPC Weights: pos=%.2f, heading=%.2f, accel=%.2f",
+             weight_position_error_, weight_heading_error_, weight_acceleration_);
     
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
@@ -28,7 +34,6 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     sub_odom_ = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
     sub_global_plan_ = nh_.subscribe("/move_base/TrajectoryPlannerROS/global_plan", 1, 
                                      &MPCNode::callbackGlobalPlan, this);
-
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
     
@@ -46,17 +51,14 @@ MPCNode::~MPCNode() {
 }
 
 void MPCNode::initializeAcadosSolver() {
-    // Create ACADOS solver capsule
     acados_ocp_capsule_ = jackal_diff_drive_acados_create_capsule();
     
-    // Create the solver
     int status = jackal_diff_drive_acados_create(acados_ocp_capsule_);
     if (status != 0) {
         ROS_ERROR("Failed to create ACADOS solver");
         return;
     }
     
-    // Get pointers to solver components
     nlp_config_ = jackal_diff_drive_acados_get_nlp_config(acados_ocp_capsule_);
     nlp_dims_ = jackal_diff_drive_acados_get_nlp_dims(acados_ocp_capsule_);
     nlp_in_ = jackal_diff_drive_acados_get_nlp_in(acados_ocp_capsule_);
@@ -80,6 +82,9 @@ void MPCNode::cleanupAcadosSolver() {
     }
 }
 
+// =============================================================================
+// Callbacks
+// =============================================================================
 void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     double yaw = quaternionToYaw(msg->pose.pose.orientation);
     double x = msg->pose.pose.position.x;
@@ -87,18 +92,15 @@ void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     double v = msg->twist.twist.linear.x;
     double w = msg->twist.twist.angular.z;
     
-    // Convert to wheel velocities
     double vr = v + w * WHEELBASE / 2.0;
     double vl = v - w * WHEELBASE / 2.0;
     
-    // Update current state [x, y, theta, vr, vl]
     current_state_[0] = x;
     current_state_[1] = y;
     current_state_[2] = yaw;
     current_state_[3] = vr;
     current_state_[4] = vl;
     
-    // Publish marker
     publishMarker();
 }
 
@@ -109,7 +111,6 @@ void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
     og_y_ref_.clear();
     theta_ref_.clear();
     
-    // Downsample if too many points
     int skip = (msg->poses.size() <= 2 * (N_ + 5)) ? 1 : 2;
     
     for (size_t i = 0; i < msg->poses.size(); i += skip) {
@@ -117,18 +118,16 @@ void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
         og_y_ref_.push_back(msg->poses[i].pose.position.y);
     }
     
-    // Compute heading angles
     double center_heading = current_state_[2];
     for (size_t i = 0; i < og_x_ref_.size() - 1; ++i) {
         double dx = og_x_ref_[i+1] - og_x_ref_[i];
         double dy = og_y_ref_[i+1] - og_y_ref_[i];
         double theta = std::atan2(dy, dx);
-        double theta_proc = headingPreprocess(center_heading, theta);
-        theta_ref_.push_back(theta_proc);
-        
+        double theta_proc = headingPreprocess(center_heading, theta);        
         if (i == 0) {
-            theta_ref_.push_back(theta_proc);
+            theta_ref_.push_back(theta_proc);  // duplicate first so indexing aligns
         }
+        theta_ref_.push_back(theta_proc);
         center_heading = theta_proc;
     }
 }
@@ -159,55 +158,40 @@ void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     }
 }
 
+// =============================================================================
+// Utility
+// =============================================================================
 double MPCNode::quaternionToYaw(const geometry_msgs::Quaternion& q) {
-    double q0 = q.x;
-    double q1 = q.y;
-    double q2 = q.z;
-    double q3 = q.w;
+    double q0 = q.x, q1 = q.y, q2 = q.z, q3 = q.w;
     return std::atan2(2.0 * (q2 * q3 + q0 * q1), 1.0 - 2.0 * (q1 * q1 + q2 * q2));
 }
 
 double MPCNode::headingPreprocess(double center, double target) {
-    double min = center - M_PI;
-    double max = center + M_PI;
-    
-    while (target < min) {
-        target += 2.0 * M_PI;
-    }
-    while (target > max) {
-        target -= 2.0 * M_PI;
-    }
-    
+    double lo = center - M_PI;
+    double hi = center + M_PI;
+    while (target < lo) target += 2.0 * M_PI;
+    while (target > hi) target -= 2.0 * M_PI;
     return target;
 }
 
 double MPCNode::diffAngle(double a1, double a2) {
     double diff = std::max(a1, a2) - std::min(a1, a2);
-    if (diff > M_PI) {
-        diff = 2.0 * M_PI - diff;
-    }
+    if (diff > M_PI) diff = 2.0 * M_PI - diff;
     return diff;
 }
 
 bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
-    // Transform obstacle to robot's local frame
     double dx = ox - rx;
     double dy = oy - ry;
-
-    // Rotate by -rtheta. We only care about the new Y coordinate (Lateral distance)
-    // local_y = -sin(theta)*dx + cos(theta)*dy
     double local_y = -std::sin(rtheta) * dx + std::cos(rtheta) * dy;
-
-    return local_y > 0; // Positive Y is Left
+    return local_y > 0;
 }
 
 bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
                                    double current_theta) {
-    // Check if more than 50% of trajectory points require reversal
-    // (angle difference > pi/2 from current heading)
     if (theta_ref.empty()) return false;
     
-    int count = 0;
+    int count  = 0;
     int length = std::min(static_cast<int>(theta_ref.size()), N_);
     
     for (int i = 1; i < length; ++i) {
@@ -216,36 +200,26 @@ bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
         }
     }
     
-    return (static_cast<double>(count) / length) > 0.5;
+    return (static_cast<double>(count) / length) > 0.7;
 }
 
 std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x_ref,
                                                      const std::vector<double>& y_ref,
                                                      double current_theta) {
-    // Compute reversed theta references by looking at path backwards
-    // (from point i to point i-1 instead of i to i+1)
     std::vector<double> reverse_theta;
-    
-    if (x_ref.size() < 2) {
-        return reverse_theta;
-    }
+    if (x_ref.size() < 2) return reverse_theta;
     
     double center_heading = current_theta;
     
     for (size_t i = 0; i < std::min(static_cast<size_t>(N_), x_ref.size() - 1); ++i) {
-        // Compute angle from current point to previous point (reversed direction)
-        double dx = x_ref[i] - x_ref[i + 1];
+        double dx = x_ref[i] - x_ref[i + 1]; 
         double dy = y_ref[i] - y_ref[i + 1];
         double theta = std::atan2(dy, dx);
-        
-        // Preprocess to keep angle continuous
         double theta_preprocessed = headingPreprocess(center_heading, theta);
         reverse_theta.push_back(theta_preprocessed);
-        
         center_heading = theta_preprocessed;
     }
     
-    // Add one more element for terminal reference
     if (!reverse_theta.empty()) {
         reverse_theta.push_back(reverse_theta.back());
     }
@@ -264,14 +238,16 @@ void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
         double dx = x_ref[i] - curr_x;
         double dy = y_ref[i] - curr_y;
         double dist = std::sqrt(dx*dx + dy*dy);
-        
         if (dist < min_dist) {
             min_dist = dist;
-            min_idx = i;
+            min_idx  = static_cast<int>(i);
         }
     }
 }
 
+// =============================================================================
+// OCP Solver
+// =============================================================================
 bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& y_ref,
                        const std::vector<double>& theta_ref,
@@ -288,9 +264,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                                   "ubx", (void*)current_state.data());
     
     // =========================================================================
-    // 2. DETERMINE CONTROL MODE (SAFE / CAREFUL / OBSTACLE)
+    // 2. DETERMINE CONTROL MODE & COMPUTE EFFECTIVE WEIGHTS
     // =========================================================================
-    bool has_close_obstacles = false;
+    bool   has_close_obstacles = false;
     double closest_obstacle_dist = std::numeric_limits<double>::max();
     
     if (!obs_x.empty()) {
@@ -298,57 +274,31 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             double dx = obs_x[i] - current_state[0];
             double dy = obs_y[i] - current_state[1];
             double dist = std::sqrt(dx*dx + dy*dy);
-            
-            if (dist < closest_obstacle_dist) {
-                closest_obstacle_dist = dist;
-            }
-            
-            if (dist < SAFE_DISTANCE) {
-                has_close_obstacles = true;
-            }
+            if (dist < closest_obstacle_dist) closest_obstacle_dist = dist;
+            if (dist < SAFE_DISTANCE) has_close_obstacles = true;
         }
     }
     
-    // FIXED: More intuitive mode selection logic
-    // Variables renamed for clarity:
-    // - v_linear_limit: the actual velocity constraint applied to the solver
-    // - v_target: the desired reference velocity for tracking
-    
-    double v_linear_limit;  // Velocity constraint for solver [m/s]
-    double v_target;        // Target velocity for cost function [m/s]
+    // Start with the base acceleration weight
+    double effective_accel_weight = weight_acceleration_;
     
     if (!has_close_obstacles) {
-        // SAFE MODE: No obstacles within SAFE_DISTANCE
         mode_ = ControlMode::SAFE;
-        v_linear_limit = v_linear_max_;           // Full speed: 2.0 m/s
-        v_target = v_linear_max_ * 0.85;          // Target: 1.5 m/s
-        weight_acceleration_ = 1.0;
         display_text_ = "SAFE";
         ROS_INFO_THROTTLE(2.0, "Mode: SAFE (closest obs: %.2fm)", closest_obstacle_dist);
-    } else if (closest_obstacle_dist < SAFE_DISTANCE * 0.5) {
-        // CAREFUL MODE: Obstacles very close (within half of SAFE_DISTANCE)
-        mode_ = ControlMode::CAREFUL;
-        v_linear_limit = v_linear_max_ * 0.5;     // Limit: 1.0 m/s
-        v_target = v_linear_max_ * 0.375;         // Target: 0.75 m/s
-        weight_acceleration_ = 0.1;
-        display_text_ = "CAREFUL";
-        ROS_WARN_THROTTLE(2.0, "Mode: CAREFUL (closest obs: %.2fm)", closest_obstacle_dist);
     } else {
-        // OBSTACLE MODE: Obstacles present but not very close
         mode_ = ControlMode::OBSTACLE;
-        v_linear_limit = v_linear_max_ * 0.85;    // Limit: 1.5 m/s
-        v_target = v_linear_max_ * 0.7;         // Target: 1.25 m/s
-        weight_acceleration_ = 0.1;
         display_text_ = "OBSTACLE";
+        // Increase accel weight for smoother control near obstacles
+        effective_accel_weight = weight_acceleration_ * 5.0;
         ROS_INFO_THROTTLE(2.0, "Mode: OBSTACLE (closest obs: %.2fm)", closest_obstacle_dist);
     }
     
-    // Handle Reversal Mode Logic
+    // --- Reversal logic ---
     reverse_mode_ = false;
     std::vector<double> effective_theta_ref = theta_ref;
     
-    if ((mode_ == ControlMode::CAREFUL || mode_ == ControlMode::OBSTACLE) && 
-        checkReversalNeeded(theta_ref, current_state[2])) {
+    if (mode_ == ControlMode::OBSTACLE && checkReversalNeeded(theta_ref, current_state[2])) {
         reverse_mode_ = true;
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
@@ -359,18 +309,12 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 3. UPDATE CONSTRAINT BOUNDS
     // =========================================================================
-    // FIXED: Now correctly constrains v_linear (not vr+vl)
-    // h_expr = [(vr+vl)/2, (vr-vl)/L, dist_L_sq, dist_R_sq]
-    //          [v_linear,  omega,     dist_L,    dist_R   ]
-    
-    double omega_limit = 0.8;  // Angular velocity limit [rad/s]
+    double omega_limit  = 1.8; 
     double dist_bound = min_obstacle_distance_ * min_obstacle_distance_;
     
-    // Construct the bounds arrays (Size 4)
-    double lh[4] = {-v_linear_limit, -omega_limit, dist_bound, dist_bound};
-    double uh[4] = {v_linear_limit, omega_limit, 1.0e9, 1.0e9};
+    double lh[4] = {-v_linear_max_, -omega_limit, dist_bound, dist_bound};
+    double uh[4] = { v_linear_max_,  omega_limit, 1.0e9,      1.0e9     };
 
-    // Update bounds for stages 0 to N-1
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
@@ -379,31 +323,25 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 4. UPDATE COST WEIGHTS (W Matrix)
     // =========================================================================
-    // The W matrix is (nx + nu) x (nx + nu). For this robot: 5 + 2 = 7x7.
-    int ny = nx_ + nu_;
+    int ny = 3 + nu_;   // 5: [x, y, theta, ar, al]
     std::vector<double> W(ny * ny, 0.0);
-    
-    // Fill the diagonal.
-    // Index mapping: 0:x, 1:y, 2:theta, 3:vr, 4:vl, 5:ar, 6:al
-    W[0 * ny + 0] = weight_position_error_;
-    W[1 * ny + 1] = weight_position_error_;
-    W[2 * ny + 2] = 1.0;                    
-    W[3 * ny + 3] = weight_velocity_ref_;   
-    W[4 * ny + 4] = weight_velocity_ref_;   
-    W[5 * ny + 5] = weight_acceleration_;   // Dynamic!
-    W[6 * ny + 6] = weight_acceleration_;   // Dynamic!
-    
+
+    W[0 * ny + 0] = weight_position_error_;   // x
+    W[1 * ny + 1] = weight_position_error_;   // y
+    W[2 * ny + 2] = weight_heading_error_;    // theta
+    W[3 * ny + 3] = effective_accel_weight;   // ar
+    W[4 * ny + 4] = effective_accel_weight;   // al
+
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
     }
 
     // =========================================================================
-    // 5. PER-STAGE UPDATE: REFERENCE & INDEPENDENT OBSTACLES
+    // 5. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
     // =========================================================================
     double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
     for (int i = 0; i <= N_; ++i) {
-        // --- A. GET REFERENCE POINT FOR THIS STAGE ---
         int ref_idx = std::min(i, static_cast<int>(x_ref.size()) - 1);
         int theta_ref_idx = std::min(i, static_cast<int>(effective_theta_ref.size()) - 1);
         
@@ -411,67 +349,45 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         double stage_y = y_ref[ref_idx];
         double stage_theta = effective_theta_ref[theta_ref_idx];
 
-        // --- B. SET COST REFERENCE (yref) ---
+        // --- Cost reference ---
         if (i < N_) {
-            // FIXED: Clearer velocity reference calculation
-            // Convert v_target to wheel velocities
-            double vr_target = reverse_mode_ ? (-v_target * reversa_alpha) : v_target;
-            double vl_target = vr_target;  // Both wheels same for straight motion
-            
-            double y_ref_stage[7];
+            double y_ref_stage[5];
             y_ref_stage[0] = stage_x;
             y_ref_stage[1] = stage_y;
             y_ref_stage[2] = stage_theta;
-            y_ref_stage[3] = vr_target;
-            y_ref_stage[4] = vl_target;
-            y_ref_stage[5] = 0.0;
-            y_ref_stage[6] = 0.0;
+            y_ref_stage[3] = 0.0;   // ar reference = 0 (minimise acceleration)
+            y_ref_stage[4] = 0.0;   // al reference = 0
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
         } else {
-            double y_ref_e[5];
+            double y_ref_e[3];
             y_ref_e[0] = stage_x;
             y_ref_e[1] = stage_y;
             y_ref_e[2] = stage_theta;
-            y_ref_e[3] = 0.0;
-            y_ref_e[4] = 0.0;
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
         }
 
-        // --- C. FIND CLOSEST LEFT & RIGHT OBSTACLES ---
+        // --- Closest left / right obstacles within search radius ---
         std::vector<double> obs_L = {1000.0, 1000.0}; 
         std::vector<double> obs_R = {1000.0, 1000.0}; 
         double min_dist_L = std::numeric_limits<double>::max();
         double min_dist_R = std::numeric_limits<double>::max();
 
         if (!obs_x.empty()) {
-            for(size_t j = 0; j < obs_x.size(); ++j) {
+            for (size_t j = 0; j < obs_x.size(); ++j) {
                 double d2 = std::pow(obs_x[j] - stage_x, 2) + std::pow(obs_y[j] - stage_y, 2);
                 if (d2 > search_radius_sq) continue;
                 
                 if (isLeft(stage_x, stage_y, stage_theta, obs_x[j], obs_y[j])) {
-                    if (d2 < min_dist_L) {
-                        min_dist_L = d2;
-                        obs_L[0] = obs_x[j];
-                        obs_L[1] = obs_y[j];
-                    }
+                    if (d2 < min_dist_L) { min_dist_L = d2; obs_L[0] = obs_x[j]; obs_L[1] = obs_y[j]; }
                 } else {
-                    if (d2 < min_dist_R) {
-                        min_dist_R = d2;
-                        obs_R[0] = obs_x[j];
-                        obs_R[1] = obs_y[j];
-                    }
+                    if (d2 < min_dist_R) { min_dist_R = d2; obs_R[0] = obs_x[j]; obs_R[1] = obs_y[j]; }
                 }
             }
         }
 
-        // --- D. UPDATE ACADOS PARAMETERS ---
-        double p_data[4];
-        p_data[0] = obs_L[0];
-        p_data[1] = obs_L[1];
-        p_data[2] = obs_R[0];
-        p_data[3] = obs_R[1];
+        // --- Update ACADOS parameters ---
+        double p_data[4] = { obs_L[0], obs_L[1], obs_R[0], obs_R[1] };
         
-        // Use the correct function for parameter update
         if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0) {
             jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
         }
@@ -490,6 +406,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 7. EXTRACT SOLUTION
     // =========================================================================
+    
     double u_opt[2];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_opt);
     
@@ -501,6 +418,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     v_opt_ = (vr_opt + vl_opt) / 2.0;
     w_opt_ = (vr_opt - vl_opt) / WHEELBASE;
     
+    // Publish predicted trajectory for visualisation
     std::vector<double> x_traj, y_traj;
     for (int i = 0; i < N_; ++i) {
         double x_stage[5];
@@ -513,6 +431,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     return true;
 }
 
+// =============================================================================
+// Publishers
+// =============================================================================
 void MPCNode::publishVelocity(double v, double w) {
     geometry_msgs::Twist vel_msg;
     vel_msg.linear.x = v;
@@ -555,25 +476,11 @@ void MPCNode::publishMarker() {
     
     marker.color.a = 1.0;
     if (reverse_mode_) {
-        // Blue for reversal mode
-        marker.color.r = 0.0;
-        marker.color.g = 0.0;
-        marker.color.b = 1.0;
+        marker.color.r = 0.0; marker.color.g = 0.0; marker.color.b = 1.0;  // Blue
     } else if (mode_ == ControlMode::SAFE) {
-        // Green for safe mode
-        marker.color.r = 0.0;
-        marker.color.g = 1.0;
-        marker.color.b = 0.0;
-    } else if (mode_ == ControlMode::OBSTACLE) {
-        // Yellow for obstacle mode
-        marker.color.r = 1.0;
-        marker.color.g = 1.0;
-        marker.color.b = 0.0;
+        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0;  // Green
     } else {
-        // Red for careful mode
-        marker.color.r = 1.0;
-        marker.color.g = 0.0;
-        marker.color.b = 0.0;
+        marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0;  // Yellow
     }
     
     pub_marker_.publish(marker);
@@ -581,20 +488,21 @@ void MPCNode::publishMarker() {
     // Text marker
     marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
     marker.text = "V: " + std::to_string(v_opt_).substr(0, 5) + 
-                  " W: " + std::to_string(w_opt_).substr(0, 5) + 
-                  "\n" + display_text_;
+                    " W: " + std::to_string(w_opt_).substr(0, 5) + 
+                    "\n" + display_text_;
     marker.scale.z = 0.2;
     pub_marker_.publish(marker);
 }
 
+// =============================================================================
+// Main loop
+// =============================================================================
 void MPCNode::run() {
     std::lock_guard<std::mutex> lock(solver_mutex_);
     try {
-        // Find closest point on reference trajectory
-        if (og_x_ref_.empty() || theta_ref_.empty()) {
-            return;
-        }
+        if (og_x_ref_.empty() || theta_ref_.empty()) return;
         
+        // Find closest point on global reference
         int min_idx = 0;
         findClosestPoint(og_x_ref_, og_y_ref_, 
                         current_state_[0], current_state_[1], min_idx);
@@ -649,12 +557,17 @@ void MPCNode::run() {
             publishVelocity(v_opt_, w_opt_);
             ROS_INFO("V: %.3f, W: %.3f, Mode: %s", v_opt_, w_opt_, display_text_.c_str());
         } else {
+            v_opt_ = 0.0;
+            w_opt_ = 0.0;
             publishVelocity(0.0, 0.0);
             ROS_WARN("MPC solve failed, stopping");
         }
         
     } catch (const std::exception& e) {
         ROS_ERROR("Exception in MPC run: %s", e.what());
+        v_opt_ = 0.0;
+        w_opt_ = 0.0;
+        publishVelocity(0.0, 0.0);
     }
 }
 

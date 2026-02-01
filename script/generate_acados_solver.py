@@ -103,40 +103,61 @@ def setup_acados_ocp():
     # Dimensions
     nx = 5  # state dimension
     nu = 2  # control dimension
-    N = 25  # prediction horizon
+    ny = 3 + nu  # output dimension for cost (only x, y, theta)
+    N = 20  # prediction horizon
     
-    Tf = 2.5  # [s]
+    Tf = 2.0  # [s]
     ocp.solver_options.tf = Tf
     
     # Cost matrices
-    # Stage cost: weighted tracking error + control effort
-    Q = np.diag([5.0, 5.0, 1.0, 2.5, 2.5])  # state weights [x, y, theta, vr, vl]
-    R = np.diag([1.0, 1.0])  # control weights [ar, al]
+    Q = np.diag([50.0, 50.0, 20.0])  # [x, y, theta] - theta weight adjustable
+    R = np.diag([0.0001, 0.0001]) # control weights [ar, al]
     
     # Terminal cost
-    Q_e = np.diag([5.0, 5.0, 1.0, 0.0, 0.0])
+    Q_e = np.diag([50.0, 50.0, 20.0])  # [x, y, theta] - terminal heading weight
     
     # Set cost
     ocp.cost.cost_type = 'LINEAR_LS'
     ocp.cost.cost_type_e = 'LINEAR_LS'
     
-    # Stage cost
-    ocp.cost.W = np.block([[Q, np.zeros((nx, nu))],
-                            [np.zeros((nu, nx)), R]])
+    # # Stage cost
+    # ocp.cost.W = np.block([[Q, np.zeros((nx, nu))],
+    #                         [np.zeros((nu, nx)), R]])
     
-    ny = nx + nu  # output dimension
+    # # ny = nx + nu  # output dimension
+    # ocp.cost.Vx = np.zeros((ny, nx))
+    # ocp.cost.Vx[:nx, :nx] = np.eye(nx)
+    # ocp.cost.Vu = np.zeros((ny, nu))
+    # ocp.cost.Vu[nx:, :] = np.eye(nu)
+
+    ocp.cost.W = np.block([[Q, np.zeros((3, nu))], 
+                            [np.zeros((nu, 3)), R]])
+    
+    # Vx matrix: select which states to track (only first 3: x, y, theta)
     ocp.cost.Vx = np.zeros((ny, nx))
-    ocp.cost.Vx[:nx, :nx] = np.eye(nx)
+    ocp.cost.Vx[0, 0] = 1.0  # track x
+    ocp.cost.Vx[1, 1] = 1.0  # track y
+    ocp.cost.Vx[2, 2] = 1.0  # track theta
+
     ocp.cost.Vu = np.zeros((ny, nu))
-    ocp.cost.Vu[nx:, :] = np.eye(nu)
-    
+    ocp.cost.Vu[3:, :] = np.eye(nu)  # controls start at index 3 now
+
     # Reference (will be set online)
     ocp.cost.yref = np.zeros(ny)
-    
-    # Terminal cost
+
+    # Terminal cost - only position/heading
     ocp.cost.W_e = Q_e
-    ocp.cost.Vx_e = np.eye(nx)
-    ocp.cost.yref_e = np.zeros(nx)
+    ocp.cost.Vx_e = np.zeros((3, nx))
+    ocp.cost.Vx_e[0, 0] = 1.0  # x
+    ocp.cost.Vx_e[1, 1] = 1.0  # y
+    ocp.cost.Vx_e[2, 2] = 1.0  # theta
+    ocp.cost.yref_e = np.zeros(3)  # [x_ref, y_ref, theta_ref]
+
+    
+    # # Terminal cost
+    # ocp.cost.W_e = Q_e
+    # ocp.cost.Vx_e = np.eye(nx)
+    # ocp.cost.yref_e = np.zeros(nx)
     
     # Constraints
     # State constraints (only for vr and vl)
@@ -145,19 +166,19 @@ def setup_acados_ocp():
     ocp.constraints.ubx = np.array([2.0, 2.0])    # individual wheel velocity bounds
     
     # Control constraints
-    ocp.constraints.lbu = np.array([-1.0, -1.0])  # min accelerations
-    ocp.constraints.ubu = np.array([1.0, 1.0])    # max accelerations
+    ocp.constraints.lbu = np.array([-3.0, -3.0])  # min accelerations
+    ocp.constraints.ubu = np.array([3.0, 3.0])    # max accelerations
     ocp.constraints.idxbu = np.array([0, 1])
     
     # Nonlinear constraints
     # h_expr = [(vr+vl)/2, (vr-vl)/L, dist_L_sq, dist_R_sq]
     # Index 0: v_linear = (vr+vl)/2 ∈ [-2.0, 2.0] m/s
-    # Index 1: omega = (vr-vl)/L ∈ [-0.8, 0.8] rad/s
+    # Index 1: omega = (vr-vl)/L ∈ [-1.8, 1.8] rad/s
     # Index 2,3: distance squared constraints
     
     v_linear_max = 2.0  # Maximum linear velocity [m/s]
-    omega_max = 0.8     # Maximum angular velocity [rad/s]
-    min_dist_sq = 0.37**2  # Minimum distance squared to obstacles
+    omega_max = 1.8     # Maximum angular velocity [rad/s]
+    min_dist_sq = 0.40**2  # Minimum distance squared to obstacles
     
     ocp.constraints.lh = np.array([-v_linear_max, -omega_max, min_dist_sq, min_dist_sq])
     ocp.constraints.uh = np.array([v_linear_max, omega_max, 1e9, 1e9])
@@ -211,9 +232,6 @@ def generate_solver():
     print("ACADOS solver code generated successfully!")
     print("Generated files in: c_generated_code/")
     print("\nVelocity constraints:")
-    print("  - Linear velocity: [-2.0, 2.0] m/s")
-    print("  - Angular velocity: [-0.8, 0.8] rad/s")
-    print("  - Individual wheel velocities: [-2.0, 2.0] m/s")
     
     return acados_ocp_solver
 

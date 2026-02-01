@@ -28,8 +28,7 @@ namespace mpc_controller {
 
 enum class ControlMode {
     SAFE,
-    OBSTACLE,
-    CAREFUL
+    OBSTACLE
 };
 
 class MPCNode {
@@ -108,16 +107,15 @@ private:
     // Robot parameters
     static constexpr double WHEELBASE = 0.37558;  // Distance between wheels [m]
     
-    // FIXED: Clearer variable names
-    double SAFE_DISTANCE = 1.75;  // Distance threshold to enter SAFE mode [m] - INCREASED DEFAULT
+    double SAFE_DISTANCE = 1.25;  // Distance threshold to enter OBSTACLE mode [m]
     
     // Velocity limits (absolute physical limits)
-    double v_linear_max_ = 2.0;  // RENAMED: Maximum linear velocity [m/s]
-    double omega_max_ = 0.8;     // Maximum angular velocity [rad/s]
-    double a_max_ = 1.0;         // Maximum acceleration [m/s^2]
+    double v_linear_max_ = 2.0;   // Maximum linear velocity [m/s]
+    double omega_max_ = 1.8;      // Maximum angular velocity [rad/s] — must match Python codegen
+    double a_max_ = 3.0;          // Maximum acceleration [m/s^2]
     
     // MPC parameters
-    int N_ = 25;  // Prediction horizon
+    int N_ = 20;  // Prediction horizon
     int nx_ = 5;  // State dimension (5: x, y, theta, vr, vl)
     int nu_ = 2;  // Control dimension (2: ar, al)
     
@@ -149,18 +147,13 @@ private:
     bool reverse_mode_ = false;
     std::vector<double> reverse_theta_ref_;
     
-    // Previous solution for warm start
-    std::vector<double> previous_solution_;
-
-    // Cost weights
-    double weight_velocity_ref_ = 2.5;
-    double weight_position_error_ = 5.0;
-    double weight_acceleration_ = 1.0;
-
+    double weight_position_error_ = 50.0;
+    double weight_heading_error_ = 20.0;
+    double weight_acceleration_ = 0.0001;
     // Tuning parameters
-    double reversa_alpha = 0.7;           // Speed scaling for reverse mode
-    double obs_search_radius_ = 3.0;      // Radius to search for obstacles [m]
-    double min_obstacle_distance_ = 0.35;  // Minimum allowed distance to obstacles [m]
+    double reversa_alpha = 0.7;  
+    double obs_search_radius_ = 4.0;  
+    double min_obstacle_distance_ = 0.40;
 };
 
 } // namespace mpc_controller
