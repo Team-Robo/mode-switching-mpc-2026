@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <limits>
 
+// mpc_node.cpp
+
 namespace mpc_controller {
 
 MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
@@ -36,7 +38,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
                                      &MPCNode::callbackGlobalPlan, this);
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
-    
+    sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 1, &MPCNode::callbackTrackDynamicObstacle, this);
+
     // Initialize state
     current_state_.resize(nx_, 0.0);
     
@@ -156,6 +159,22 @@ void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
         map_x_.push_back(*iter_x);
         map_y_.push_back(*iter_y);
     }
+}
+
+void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg) {
+    dynamic_obstacles_.clear();
+    
+    for (const auto& circle : msg->circles) {
+        DynamicObstacle obs;
+        obs.x = circle.center.x;
+        obs.y = circle.center.y;
+        obs.vx = circle.velocity.x;
+        obs.vy = circle.velocity.y;
+        obs.radius = circle.true_radius;
+        
+        dynamic_obstacles_.push_back(obs);
+    }
+    ROS_INFO_THROTTLE(2.0, "Received %lu dynamic obstacles", dynamic_obstacles_.size());
 }
 
 // =============================================================================
@@ -544,8 +563,16 @@ void MPCNode::run() {
         }
         
         // Combine obstacles
-        std::vector<double> all_obs_x = obs_x_;
-        std::vector<double> all_obs_y = obs_y_;
+        std::vector<double> all_obs_x;
+        std::vector<double> all_obs_y;
+
+        // Add dynamic obstacles
+        for (const auto& obs : dynamic_obstacles_) {
+            all_obs_x.push_back(obs.x);
+            all_obs_y.push_back(obs.y);
+        }
+
+        // Add static map obstacles
         all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
         

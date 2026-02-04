@@ -1,5 +1,6 @@
 #ifndef MPC_NODE_HPP
 #define MPC_NODE_HPP
+// mpc_node.hpp
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
@@ -9,7 +10,8 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/Marker.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
-
+#include <std_msgs/Float64MultiArray.h>
+#include <obstacle_detector/Obstacles.h>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -25,6 +27,13 @@ extern "C" {
 }
 
 namespace mpc_controller {
+
+struct DynamicObstacle {
+    double x, y;
+    double vx, vy;
+    double radius;
+};
+std::vector<DynamicObstacle> dynamic_obstacles_;
 
 enum class ControlMode {
     SAFE,
@@ -56,12 +65,14 @@ private:
     ros::Subscriber sub_global_plan_;
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
+    ros::Subscriber sub_dynamic_obstacle_;
     
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
     void callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg);
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
+    void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
     
     // MPC solver
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -130,6 +141,7 @@ private:
     std::vector<double> y_ref_;
     
     // Obstacles
+    std::vector<DynamicObstacle> dynamic_obstacles_;
     std::vector<double> obs_x_;
     std::vector<double> obs_y_;
     std::vector<double> map_x_;

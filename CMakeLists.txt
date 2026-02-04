@@ -16,6 +16,7 @@ find_package(catkin REQUIRED COMPONENTS
     laser_geometry
     pcl_ros
     pcl_conversions
+    obstacle_detector
 )
 
 ## Find system dependencies
@@ -80,6 +81,7 @@ catkin_package(
         laser_geometry
         pcl_ros
         pcl_conversions
+        obstacle_detector   
 )
 
 ###########
