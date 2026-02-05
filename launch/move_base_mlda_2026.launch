@@ -37,13 +37,13 @@
         <param name="active" value="true"/>
         <param name="frame_id" value="odom"/>
         <param name="loop_rate" value="100.0"/>
-        <param name="tracking_duration" value="2.0"/>  
+        <param name="tracking_duration" value="0.1"/>
         <param name="process_variance" value="0.5"/>  
         <param name="measurement_variance" value="0.1"/> 
         <remap from="tracked_obstacles" to="/obstacles"/>
     </node>
 
-    <!-- <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/> -->
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/>
 
     <!-- Start the navigation stack -->
     <!-- The configuration files are loaded from jackal_helper -->

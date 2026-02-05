@@ -38,7 +38,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
                                      &MPCNode::callbackGlobalPlan, this);
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
-    sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 1, &MPCNode::callbackTrackDynamicObstacle, this);
+    sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10, &MPCNode::callbackTrackDynamicObstacle, this);
 
     // Initialize state
     current_state_.resize(nx_, 0.0);
@@ -174,7 +174,7 @@ void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::C
         
         dynamic_obstacles_.push_back(obs);
     }
-    ROS_INFO_THROTTLE(2.0, "Received %lu dynamic obstacles", dynamic_obstacles_.size());
+    ROS_INFO("Received %lu dynamic obstacles", dynamic_obstacles_.size());
 }
 
 // =============================================================================
@@ -264,6 +264,43 @@ void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
     }
 }
 
+std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
+    const std::vector<DynamicObstacle>& obstacles, double dt, int N) {
+    
+    std::vector<PredictedObstacle> predictions;
+
+    for (const auto& obs : obstacles) {
+        PredictedObstacle pred;
+        pred.x_predicted.resize(N + 1);
+        pred.y_predicted.resize(N + 1);
+        pred.vx_predicted.resize(N + 1);
+        pred.vy_predicted.resize(N + 1);
+        pred.radius_predicted.resize(N + 1);
+        double vx = obs.vx;
+        double vy = obs.vy;
+        double speed = std::sqrt(vx * vx + vy * vy);
+        
+        double max_accel = 0.0;
+
+        for (int i = 0; i <= N; ++i) {
+            double t = i * dt;
+            
+            // I assume it to be zero for now 
+            double ax = 0.0;
+            double ay = 0.0;
+            
+            pred.vx_predicted[i] = vx + ax * t;
+            pred.vy_predicted[i] = vy + ay * t;
+            
+            pred.x_predicted[i] = obs.x + pred.vx_predicted[i] * t;
+            pred.y_predicted[i] = obs.y + pred.vy_predicted[i] * t;
+            pred.radius_predicted[i] = obs.radius;
+        }
+        predictions.push_back(pred);
+    }
+    return predictions;
+}
+
 // =============================================================================
 // OCP Solver
 // =============================================================================
@@ -283,16 +320,35 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                                   "ubx", (void*)current_state.data());
     
     // =========================================================================
-    // 2. DETERMINE CONTROL MODE & COMPUTE EFFECTIVE WEIGHTS
+    // 2. PREDICT DYNAMIC OBSTACLES (before mode detection)
     // =========================================================================
-    bool   has_close_obstacles = false;
-    double closest_obstacle_dist = std::numeric_limits<double>::max();
+    double Tf = 2.0;
+    double dt = Tf / N_;
+    predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
     
+    // =========================================================================
+    // 3. DETERMINE CONTROL MODE & COMPUTE EFFECTIVE WEIGHTS
+    // =========================================================================
+    bool has_close_obstacles = false;
+    double closest_obstacle_dist = std::numeric_limits<double>::max();
+
+    // Check static obstacles
     if (!obs_x.empty()) {
         for (size_t i = 0; i < obs_x.size(); ++i) {
             double dx = obs_x[i] - current_state[0];
             double dy = obs_y[i] - current_state[1];
             double dist = std::sqrt(dx*dx + dy*dy);
+            if (dist < closest_obstacle_dist) closest_obstacle_dist = dist;
+            if (dist < SAFE_DISTANCE) has_close_obstacles = true;
+        }
+    }
+
+    // Check dynamic obstacles at current position
+    for (const auto& pred_obs : predicted_obstacles_) {
+        if (!pred_obs.x_predicted.empty()) {
+            double dx = pred_obs.x_predicted[0] - current_state[0];
+            double dy = pred_obs.y_predicted[0] - current_state[1];
+            double dist = std::sqrt(dx*dx + dy*dy) - pred_obs.radius_predicted[0];
             if (dist < closest_obstacle_dist) closest_obstacle_dist = dist;
             if (dist < SAFE_DISTANCE) has_close_obstacles = true;
         }
@@ -326,7 +382,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 3. UPDATE CONSTRAINT BOUNDS
+    // 4. UPDATE CONSTRAINT BOUNDS
     // =========================================================================
     double omega_limit  = 1.8; 
     double dist_bound = min_obstacle_distance_ * min_obstacle_distance_;
@@ -340,7 +396,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 4. UPDATE COST WEIGHTS (W Matrix)
+    // 5. UPDATE COST WEIGHTS (W Matrix)
     // =========================================================================
     int ny = 3 + nu_;   // 5: [x, y, theta, ar, al]
     std::vector<double> W(ny * ny, 0.0);
@@ -356,7 +412,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 5. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
+    // 6. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
     // =========================================================================
     double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
@@ -391,15 +447,63 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         double min_dist_L = std::numeric_limits<double>::max();
         double min_dist_R = std::numeric_limits<double>::max();
 
+        // 1. Check STATIC obstacles from obs_x, obs_y
         if (!obs_x.empty()) {
             for (size_t j = 0; j < obs_x.size(); ++j) {
-                double d2 = std::pow(obs_x[j] - stage_x, 2) + std::pow(obs_y[j] - stage_y, 2);
+                double dx = obs_x[j] - stage_x;
+                double dy = obs_y[j] - stage_y;
+                double d2 = dx*dx + dy*dy;
+                
                 if (d2 > search_radius_sq) continue;
                 
                 if (isLeft(stage_x, stage_y, stage_theta, obs_x[j], obs_y[j])) {
-                    if (d2 < min_dist_L) { min_dist_L = d2; obs_L[0] = obs_x[j]; obs_L[1] = obs_y[j]; }
+                    if (d2 < min_dist_L) { 
+                        min_dist_L = d2; 
+                        obs_L[0] = obs_x[j]; 
+                        obs_L[1] = obs_y[j]; 
+                    }
                 } else {
-                    if (d2 < min_dist_R) { min_dist_R = d2; obs_R[0] = obs_x[j]; obs_R[1] = obs_y[j]; }
+                    if (d2 < min_dist_R) { 
+                        min_dist_R = d2; 
+                        obs_R[0] = obs_x[j]; 
+                        obs_R[1] = obs_y[j]; 
+                    }
+                }
+            }
+        }
+
+        // 2. Check DYNAMIC obstacles at their predicted positions
+        for (const auto& pred_obs : predicted_obstacles_) {
+            if (i >= static_cast<int>(pred_obs.x_predicted.size())) continue;
+            
+            double obs_x_pred = pred_obs.x_predicted[i];
+            double obs_y_pred = pred_obs.y_predicted[i];
+            double obs_radius = pred_obs.radius_predicted[i];
+            
+            // Distance to obstacle center (ACADOS will compute this distance)
+            double dx = obs_x_pred - stage_x;
+            double dy = obs_y_pred - stage_y;
+            double dist_to_center_sq = dx*dx + dy*dy;
+            double dist_to_center = std::sqrt(dist_to_center_sq);
+            
+            if (dist_to_center > obs_search_radius_) continue;
+            
+            // For closest obstacle selection, consider distance to surface
+            // but pass CENTER position to ACADOS (it will enforce constraint on center distance)
+            double dist_to_surface = dist_to_center - obs_radius;
+            double effective_d2 = dist_to_surface * dist_to_surface;
+            
+            if (isLeft(stage_x, stage_y, stage_theta, obs_x_pred, obs_y_pred)) {
+                if (effective_d2 < min_dist_L) { 
+                    min_dist_L = effective_d2; 
+                    obs_L[0] = obs_x_pred;  // Pass CENTER position
+                    obs_L[1] = obs_y_pred; 
+                }
+            } else {
+                if (effective_d2 < min_dist_R) { 
+                    min_dist_R = effective_d2; 
+                    obs_R[0] = obs_x_pred;  // Pass CENTER position
+                    obs_R[1] = obs_y_pred; 
                 }
             }
         }
@@ -413,7 +517,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
     
     // =========================================================================
-    // 6. SOLVE
+    // 7. SOLVE
     // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
     
@@ -423,7 +527,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
     
     // =========================================================================
-    // 7. EXTRACT SOLUTION
+    // 8. EXTRACT SOLUTION
     // =========================================================================
     
     double u_opt[2];

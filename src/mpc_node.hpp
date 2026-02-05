@@ -33,7 +33,13 @@ struct DynamicObstacle {
     double vx, vy;
     double radius;
 };
-std::vector<DynamicObstacle> dynamic_obstacles_;
+struct PredictedObstacle {
+    std::vector<double> x_predicted;
+    std::vector<double> y_predicted;
+    std::vector<double> vx_predicted;
+    std::vector<double> vy_predicted;
+    std::vector<double> radius_predicted;
+};
 
 enum class ControlMode {
     SAFE,
@@ -114,6 +120,12 @@ private:
     std::vector<double> computeReverseThetaRef(const std::vector<double>& x_ref,
                                                 const std::vector<double>& y_ref,
                                                 double current_theta);
+    
+    std::vector<PredictedObstacle> predicted_obstacles_;
+    // Prediction of dynamic obs
+    std::vector<PredictedObstacle> predictObstaclesTrajectory(
+        const std::vector<DynamicObstacle>& obstacles, double dt, int N
+    );
     
     // Robot parameters
     static constexpr double WHEELBASE = 0.37558;  // Distance between wheels [m]
