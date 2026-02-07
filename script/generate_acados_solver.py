@@ -104,17 +104,17 @@ def setup_acados_ocp():
     nx = 5  # state dimension
     nu = 2  # control dimension
     ny = 3 + nu  # output dimension for cost (only x, y, theta)
-    N = 20  # prediction horizon
+    N = 25  # prediction horizon
     
-    Tf = 2.0  # [s]
+    Tf = 2.5  # [s]
     ocp.solver_options.tf = Tf
     
     # Cost matrices
-    Q = np.diag([50.0, 50.0, 20.0])  # [x, y, theta] - theta weight adjustable
-    R = np.diag([0.0001, 0.0001]) # control weights [ar, al]
+    Q = np.diag([49.0, 49.0, 37.0])  # [x, y, theta] - theta weight adjustable
+    R = np.diag([0.0021, 0.0021]) # control weights [ar, al]
     
     # Terminal cost
-    Q_e = np.diag([50.0, 50.0, 20.0])  # [x, y, theta] - terminal heading weight
+    Q_e = np.diag([49.0, 49.0, 37.0])  # [x, y, theta] - terminal heading weight
     
     # Set cost
     ocp.cost.cost_type = 'LINEAR_LS'

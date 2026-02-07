@@ -138,7 +138,7 @@ private:
     double a_max_ = 3.0;          // Maximum acceleration [m/s^2]
     
     // MPC parameters
-    int N_ = 20;  // Prediction horizon
+    int N_ = 25;  // Prediction horizon
     int nx_ = 5;  // State dimension (5: x, y, theta, vr, vl)
     int nu_ = 2;  // Control dimension (2: ar, al)
     
@@ -171,13 +171,16 @@ private:
     bool reverse_mode_ = false;
     std::vector<double> reverse_theta_ref_;
     
-    double weight_position_error_ = 50.0;
-    double weight_heading_error_ = 20.0;
-    double weight_acceleration_ = 0.0001;
+    double weight_position_error_ = 24.0;
+    double weight_heading_error_ = 29.0;
+    double weight_acceleration_ = 0.0021;
     // Tuning parameters
     double reversa_alpha = 0.7;  
     double obs_search_radius_ = 4.0;  
-    double min_obstacle_distance_ = 0.40;
+
+    double robot_radius_ = 0.35; // circumradius 
+    double dynamic_obs_radius_ = 0.5;
+    double safety_margin_ = 0.1;
 };
 
 } // namespace mpc_controller

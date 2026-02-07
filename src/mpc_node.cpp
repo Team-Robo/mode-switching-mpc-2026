@@ -13,14 +13,13 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     // Load parameters from parameter server
     nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);
-    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.7);
-    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.0);
-    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.40);
+    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.85);
+    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.6);
     nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.25);
     
-    nh_private_.param<double>("weight_position_error", weight_position_error_, 50.0);
-    nh_private_.param<double>("weight_heading_error", weight_heading_error_, 20.0);
-    nh_private_.param<double>("weight_acceleration", weight_acceleration_, 0.0001);
+    nh_private_.param<double>("weight_position_error", weight_position_error_, 49.0);
+    nh_private_.param<double>("weight_heading_error", weight_heading_error_, 37.0);
+    nh_private_.param<double>("weight_acceleration", weight_acceleration_, 0.0021);
     
     ROS_INFO("MPC Parameters: N=%d, v_linear_max=%.2f m/s, SAFE_DISTANCE=%.2f m",
              N_, v_linear_max_, SAFE_DISTANCE);
@@ -276,25 +275,21 @@ std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
         pred.vx_predicted.resize(N + 1);
         pred.vy_predicted.resize(N + 1);
         pred.radius_predicted.resize(N + 1);
-        double vx = obs.vx;
-        double vy = obs.vy;
-        double speed = std::sqrt(vx * vx + vy * vy);
         
-        double max_accel = 0.0;
-
+        // Constant velocity model
         for (int i = 0; i <= N; ++i) {
             double t = i * dt;
             
-            // I assume it to be zero for now 
-            double ax = 0.0;
-            double ay = 0.0;
+            // Constant velocity
+            pred.vx_predicted[i] = obs.vx;
+            pred.vy_predicted[i] = obs.vy;
             
-            pred.vx_predicted[i] = vx + ax * t;
-            pred.vy_predicted[i] = vy + ay * t;
+            // Linear extrapolation
+            pred.x_predicted[i] = obs.x + obs.vx * t;
+            pred.y_predicted[i] = obs.y + obs.vy * t;
             
-            pred.x_predicted[i] = obs.x + pred.vx_predicted[i] * t;
-            pred.y_predicted[i] = obs.y + pred.vy_predicted[i] * t;
-            pred.radius_predicted[i] = obs.radius;
+            // Constant radius
+            pred.radius_predicted[i] = 0.5;  // or obs.radius if variable
         }
         predictions.push_back(pred);
     }
@@ -322,7 +317,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 2. PREDICT DYNAMIC OBSTACLES (before mode detection)
     // =========================================================================
-    double Tf = 2.0;
+    double Tf = 2.5;
     double dt = Tf / N_;
     predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
     
@@ -384,11 +379,12 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 4. UPDATE CONSTRAINT BOUNDS
     // =========================================================================
-    double omega_limit  = 1.8; 
-    double dist_bound = min_obstacle_distance_ * min_obstacle_distance_;
+    double omega_limit  = 1.8;
+    double min_dist_from_center = robot_radius_ + dynamic_obs_radius_ + safety_margin_;
+    double dist_bound = min_dist_from_center * min_dist_from_center;
     
     double lh[4] = {-v_linear_max_, -omega_limit, dist_bound, dist_bound};
-    double uh[4] = { v_linear_max_,  omega_limit, 1.0e9,      1.0e9     };
+    double uh[4] = { v_linear_max_, omega_limit, 1.0e9, 1.0e9};
 
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
@@ -671,9 +667,11 @@ void MPCNode::run() {
         std::vector<double> all_obs_y;
 
         // Add dynamic obstacles
-        for (const auto& obs : dynamic_obstacles_) {
-            all_obs_x.push_back(obs.x);
-            all_obs_y.push_back(obs.y);
+        for (const auto& pred_obs : predicted_obstacles_) {
+            if (!pred_obs.x_predicted.empty()) {
+                all_obs_x.push_back(pred_obs.x_predicted[0]);
+                all_obs_y.push_back(pred_obs.y_predicted[0]);
+            }
         }
 
         // Add static map obstacles
@@ -713,7 +711,7 @@ int main(int argc, char** argv) {
     mpc_controller::MPCNode mpc_node(nh, nh_private);
 
     double mpc_rate_;
-    nh_private.param<double>("mpc_rate", mpc_rate_, 30.0);
+    nh_private.param<double>("mpc_rate", mpc_rate_, 27.5);
     ros::Rate rate(mpc_rate_);
     ros::Duration(1.0).sleep();
     
