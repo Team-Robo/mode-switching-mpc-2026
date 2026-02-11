@@ -13,7 +13,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     // Load parameters from parameter server
     nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);
-    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.85);
+    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.5);
+    nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
     nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.6);
     nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.25);
     
@@ -25,6 +26,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              N_, v_linear_max_, SAFE_DISTANCE);
     ROS_INFO("MPC Weights: pos=%.2f, heading=%.2f, accel=%.2f",
              weight_position_error_, weight_heading_error_, weight_acceleration_);
+    ROS_INFO("Reversal: threshold=%.2f, angle=%.1f deg",
+             reversal_threshold_, reversal_angle_deg_);
     
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
@@ -211,14 +214,15 @@ bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
     
     int count  = 0;
     int length = std::min(static_cast<int>(theta_ref.size()), N_);
+    double angle_threshold_rad = reversal_angle_deg_ * M_PI / 180.0;
     
     for (int i = 1; i < length; ++i) {
-        if (diffAngle(current_theta, theta_ref[i]) > M_PI / 2.0) {
+        if (diffAngle(current_theta, theta_ref[i]) > angle_threshold_rad) {
             count++;
         }
     }
     
-    return (static_cast<double>(count) / length) > 0.7;
+    return (static_cast<double>(count) / length) > reversal_threshold_;
 }
 
 std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x_ref,
@@ -352,28 +356,25 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // Start with the base acceleration weight
     double effective_accel_weight = weight_acceleration_;
     
-    if (!has_close_obstacles) {
-        mode_ = ControlMode::SAFE;
-        display_text_ = "SAFE";
-        ROS_INFO_THROTTLE(2.0, "Mode: SAFE (closest obs: %.2fm)", closest_obstacle_dist);
-    } else {
-        mode_ = ControlMode::OBSTACLE;
-        display_text_ = "OBSTACLE";
-        // Increase accel weight for smoother control near obstacles
+    // Increase accel weight for smoother control near obstacles
+    if (has_close_obstacles) {
         effective_accel_weight = weight_acceleration_ * 5.0;
-        ROS_INFO_THROTTLE(2.0, "Mode: OBSTACLE (closest obs: %.2fm)", closest_obstacle_dist);
+        ROS_INFO_THROTTLE(2.0, "Obstacles detected (closest: %.2fm)", closest_obstacle_dist);
     }
     
     // --- Reversal logic ---
-    reverse_mode_ = false;
     std::vector<double> effective_theta_ref = theta_ref;
     
-    if (mode_ == ControlMode::OBSTACLE && checkReversalNeeded(theta_ref, current_state[2])) {
-        reverse_mode_ = true;
+    if (checkReversalNeeded(theta_ref, current_state[2])) {
+        mode_ = ControlMode::REVERSAL;
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
-        display_text_ = "REVERSING";
+        display_text_ = "REVERSAL";
         ROS_INFO_THROTTLE(1.0, "Reversal mode activated");
+    } else {
+        mode_ = ControlMode::NORMAL;
+        display_text_ = "NORMAL";
+        ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
     }
 
     // =========================================================================
@@ -594,12 +595,10 @@ void MPCNode::publishMarker() {
     marker.scale.z = 0.2;
     
     marker.color.a = 1.0;
-    if (reverse_mode_) {
-        marker.color.r = 0.0; marker.color.g = 0.0; marker.color.b = 1.0;  // Blue
-    } else if (mode_ == ControlMode::SAFE) {
-        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0;  // Green
+    if (mode_ == ControlMode::REVERSAL) {
+        marker.color.r = 1.0; marker.color.g = 0.0; marker.color.b = 0.0;  // Red
     } else {
-        marker.color.r = 1.0; marker.color.g = 1.0; marker.color.b = 0.0;  // Yellow
+        marker.color.r = 0.0; marker.color.g = 1.0; marker.color.b = 0.0;  // Green
     }
     
     pub_marker_.publish(marker);

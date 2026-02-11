@@ -42,8 +42,8 @@ struct PredictedObstacle {
 };
 
 enum class ControlMode {
-    SAFE,
-    OBSTACLE
+    NORMAL,
+    REVERSAL
 };
 
 class MPCNode {
@@ -160,7 +160,7 @@ private:
     std::vector<double> map_y_;
     
     // Control mode
-    ControlMode mode_ = ControlMode::SAFE;
+    ControlMode mode_ = ControlMode::NORMAL;
     std::string display_text_;
     
     // Optimal controls
@@ -168,14 +168,14 @@ private:
     double w_opt_ = 0.0; // Angular velocity
     
     // Reversal state
-    bool reverse_mode_ = false;
     std::vector<double> reverse_theta_ref_;
     
     double weight_position_error_ = 24.0;
     double weight_heading_error_ = 29.0;
     double weight_acceleration_ = 0.0021;
     // Tuning parameters
-    double reversa_alpha = 0.7;  
+    double reversal_threshold_ = 0.7;  // Fraction of waypoints that must be backwards to trigger reversal
+    double reversal_angle_deg_ = 90.0; // Angle threshold (degrees) to consider a waypoint "backwards"
     double obs_search_radius_ = 4.0;  
 
     double robot_radius_ = 0.35; // circumradius 
