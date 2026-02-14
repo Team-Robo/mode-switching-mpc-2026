@@ -1,0 +1,62 @@
+<launch>
+    <!-- 
+    Launch file for MPC navigation with SAC weight tuner.
+    Includes: obstacle tracker, move_base, MPC node, weight tuner.
+    
+    For deployment on i3 CPU: weight_tuner runs at 5 Hz with tiny MLP.
+    -->
+
+    <!-- Obstacle detection & tracking -->
+    <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
+        <arg name="rviz" value="false"/>
+        <arg name="tracker_bridge" value="false"/>
+    </include>
+
+    <!-- Navigation stack (move_base provides global plan, MPC overrides cmd_vel) -->
+    <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
+        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+            command="load" ns="global_costmap" />
+        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+            command="load" ns="local_costmap" />
+        <rosparam
+            file="$(find jackal_helper)/configs/params/odom_nav_params/global_costmap_params_mpc_tuned.yaml"
+            command="load" />
+        <rosparam
+            file="$(find jackal_helper)/configs/params/odom_nav_params/local_costmap_params_mpc_tuned.yaml"
+            command="load" />
+        <rosparam file="$(find jackal_helper)/configs/params/base_local_planner_params.yaml"
+            command="load" />
+        <rosparam file="$(find jackal_helper)/configs/params/move_base_params.yaml" command="load" />
+
+        <param name="base_global_planner" type="string" value="navfn/NavfnROS" />
+        <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />
+        <param name="NavfnROS/default_tolerance" value="0.1" />
+        <remap from="odom" to="odometry/filtered" />
+        <remap from="cmd_vel" to="dump/cmd_vel" />
+    </node>
+
+    <!-- Sensor preprocessing -->
+    <node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud" />
+    <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud" />
+
+    <!-- MPC controller (C++, 27.5 Hz) — now subscribes to /mpc_weights -->
+    <node pkg="teamrobo2026" type="mpc_node" name="teamrobo2026" output="screen">
+        <!-- Default weights (used until weight_tuner publishes) -->
+        <param name="weight_position_error" value="49.0" />
+        <param name="weight_heading_error" value="37.0" />
+        <param name="weight_acceleration" value="0.0021" />
+        <param name="v_linear_max" value="2.0" />
+        <param name="SAFE_DISTANCE" value="1.25" />
+        <param name="obs_search_radius" value="4.6" />
+        <param name="mpc_rate" value="27.5" />
+    </node>
+
+    <!-- SAC weight tuner (Python, 5 Hz, ~0.3ms per inference on i3) -->
+    <node pkg="teamrobo2026" type="weight_tuner_node.py" name="weight_tuner" output="screen">
+        <param name="model_path" value="$(find teamrobo2026)/checkpoints/sac_mpc_final" />
+        <param name="rate_hz" value="5.0" />
+        <!-- Goal coordinates (will be overridden by run.py for each world) -->
+        <param name="goal_x" value="0.0" />
+        <param name="goal_y" value="10.0" />
+    </node>
+</launch>

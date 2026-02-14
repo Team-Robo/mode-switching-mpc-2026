@@ -12,6 +12,7 @@
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/Float64MultiArray.h>
 #include <obstacle_detector/Obstacles.h>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <cmath>
@@ -72,6 +73,10 @@ private:
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     ros::Subscriber sub_dynamic_obstacle_;
+    ros::Subscriber sub_mpc_weights_;      // RL weight updates
+
+    // Diagnostics publisher (for RL observation)
+    ros::Publisher pub_mpc_diagnostics_;
     
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
@@ -79,6 +84,8 @@ private:
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
+    void callbackMpcWeights(const std_msgs::Float64MultiArray::ConstPtr& msg);
+    void publishDiagnostics(double solve_time_ms);
     
     // MPC solver
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -181,6 +188,9 @@ private:
     double robot_radius_ = 0.35; // circumradius 
     double dynamic_obs_radius_ = 0.5;
     double safety_margin_ = 0.1;
+
+    // RL weight tuning: last MPC solve time for diagnostics
+    double last_solve_time_ms_ = 0.0;
 };
 
 } // namespace mpc_controller

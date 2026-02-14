@@ -3,6 +3,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <algorithm>
 #include <limits>
+#include <chrono>
 
 // mpc_node.cpp
 
@@ -33,6 +34,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
     pub_marker_ = nh_.advertise<visualization_msgs::Marker>("/mode", 1);
+    pub_mpc_diagnostics_ = nh_.advertise<std_msgs::Float64MultiArray>("/mpc_diagnostics", 1);
     
     // Initialize subscribers
     sub_odom_ = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
@@ -41,6 +43,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
     sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10, &MPCNode::callbackTrackDynamicObstacle, this);
+    sub_mpc_weights_ = nh_.subscribe("/mpc_weights", 1, &MPCNode::callbackMpcWeights, this);
 
     // Initialize state
     current_state_.resize(nx_, 0.0);
@@ -177,6 +180,27 @@ void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::C
         dynamic_obstacles_.push_back(obs);
     }
     ROS_INFO("Received %lu dynamic obstacles", dynamic_obstacles_.size());
+}
+
+void MPCNode::callbackMpcWeights(const std_msgs::Float64MultiArray::ConstPtr& msg) {
+    // Receive [weight_position_error, weight_heading_error, weight_acceleration]
+    if (msg->data.size() >= 3) {
+        weight_position_error_ = msg->data[0];
+        weight_heading_error_  = msg->data[1];
+        weight_acceleration_   = msg->data[2];
+        ROS_INFO_THROTTLE(2.0, "RL weights updated: pos=%.2f, head=%.2f, accel=%.5f",
+                          weight_position_error_, weight_heading_error_, weight_acceleration_);
+    }
+}
+
+void MPCNode::publishDiagnostics(double solve_time_ms) {
+    // Publish [solve_time_ms, is_reversal, n_dynamic_obs] for RL agent observation
+    std_msgs::Float64MultiArray diag;
+    diag.data.resize(3);
+    diag.data[0] = solve_time_ms;
+    diag.data[1] = (mode_ == ControlMode::REVERSAL) ? 1.0 : 0.0;
+    diag.data[2] = static_cast<double>(dynamic_obstacles_.size());
+    pub_mpc_diagnostics_.publish(diag);
 }
 
 // =============================================================================
@@ -678,12 +702,20 @@ void MPCNode::run() {
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
         
         // Solve MPC
+        auto t_solve_start = std::chrono::steady_clock::now();
         bool success = solveOCP(x_ref_, y_ref_, theta_ref_subset, 
                                current_state_, all_obs_x, all_obs_y);
+        auto t_solve_end = std::chrono::steady_clock::now();
+        double solve_ms = std::chrono::duration<double, std::milli>(t_solve_end - t_solve_start).count();
+        last_solve_time_ms_ = solve_ms;
+        
+        // Publish diagnostics for RL weight tuner
+        publishDiagnostics(solve_ms);
         
         if (success) {
             publishVelocity(v_opt_, w_opt_);
-            ROS_INFO("V: %.3f, W: %.3f, Mode: %s", v_opt_, w_opt_, display_text_.c_str());
+            ROS_INFO("V: %.3f, W: %.3f, Mode: %s (solve: %.1fms)", 
+                     v_opt_, w_opt_, display_text_.c_str(), solve_ms);
         } else {
             v_opt_ = 0.0;
             w_opt_ = 0.0;

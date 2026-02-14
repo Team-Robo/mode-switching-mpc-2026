@@ -192,6 +192,7 @@ endif()
 
 catkin_install_python(PROGRAMS 
   script/generate_acados_solver.py
+  script/weight_tuner_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

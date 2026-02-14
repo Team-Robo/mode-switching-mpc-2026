@@ -1,0 +1,38 @@
+# SAC weight tuner configuration
+# These values define the RL agent's operating parameters
+
+# --- Inference ---
+rate_hz: 5.0            # RL decision frequency (Hz)
+                        # Trade-off: Higher = more reactive but more CPU load
+                        # 5 Hz is ~1ms total on i3, negligible vs MPC's 5-20ms
+
+# --- Weight bounds ---
+# The SAC policy outputs normalised actions in [-1,1] which are
+# mapped into these ranges. Wider ranges = more exploration but
+# potentially unstable MPC if weights change too drastically.
+weight_position_error:
+  min: 1.0
+  max: 100.0
+  default: 49.0
+
+weight_heading_error:
+  min: 1.0
+  max: 100.0
+  default: 37.0
+
+weight_acceleration:
+  min: 0.0001
+  max: 0.1
+  default: 0.0021
+
+# --- Model ---
+# model_path: path to SB3 checkpoint (.zip)
+# onnx_path: path to ONNX model (faster, ~0.05ms vs ~0.3ms on i3)
+model_path: "$(find teamrobo2026)/checkpoints/sac_mpc_final"
+# onnx_path: "$(find teamrobo2026)/checkpoints/sac_policy.onnx"
+
+# --- Goal ---
+# These should match the BARN challenge goal coordinates
+# Updated per-world by the launch system
+goal_x: 0.0
+goal_y: 10.0
