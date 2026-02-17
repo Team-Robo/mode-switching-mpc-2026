@@ -1,2 +1,5 @@
 c_generated_code/
 script/acados_ocp.json
+__pycache__/
+*.pyc
+rl_logs/

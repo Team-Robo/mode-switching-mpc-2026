@@ -104,9 +104,9 @@ def setup_acados_ocp():
     nx = 5  # state dimension
     nu = 2  # control dimension
     ny = 3 + nu  # output dimension for cost (only x, y, theta)
-    N = 25  # prediction horizon
+    N = 20  # prediction horizon
     
-    Tf = 2.5  # [s]
+    Tf = 2.0  # [s]
     ocp.solver_options.tf = Tf
     
     # Cost matrices

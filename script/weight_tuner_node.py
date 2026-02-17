@@ -33,10 +33,9 @@ from geometry_msgs.msg import Quaternion
 LASER_MAX_RANGE = 10.0
 
 # Weight bounds (must match training)
-W_POS_LO,  W_POS_HI  = 1.0, 100.0
-W_HEAD_LO, W_HEAD_HI = 1.0, 100.0
+W_POS_LO,  W_POS_HI  = 5.0, 100.0
+W_HEAD_LO, W_HEAD_HI = 5.0, 100.0
 W_ACC_LO,  W_ACC_HI  = 0.0001, 0.1
-
 
 def _quat_to_yaw(q):
     siny = 2.0 * (q.w * q.z + q.x * q.y)

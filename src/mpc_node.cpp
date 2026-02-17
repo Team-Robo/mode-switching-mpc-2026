@@ -14,7 +14,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     // Load parameters from parameter server
     nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);
-    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.5);
+    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.7);
     nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
     nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.6);
     nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.25);
@@ -103,6 +103,7 @@ void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     double vr = v + w * WHEELBASE / 2.0;
     double vl = v - w * WHEELBASE / 2.0;
     
+    // Update current state
     current_state_[0] = x;
     current_state_[1] = y;
     current_state_[2] = yaw;
@@ -179,7 +180,7 @@ void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::C
         
         dynamic_obstacles_.push_back(obs);
     }
-    ROS_INFO("Received %lu dynamic obstacles", dynamic_obstacles_.size());
+    ROS_INFO_THROTTLE(2.0, "Received %lu dynamic obstacles", dynamic_obstacles_.size());
 }
 
 void MPCNode::callbackMpcWeights(const std_msgs::Float64MultiArray::ConstPtr& msg) {
@@ -193,13 +194,14 @@ void MPCNode::callbackMpcWeights(const std_msgs::Float64MultiArray::ConstPtr& ms
     }
 }
 
-void MPCNode::publishDiagnostics(double solve_time_ms) {
-    // Publish [solve_time_ms, is_reversal, n_dynamic_obs] for RL agent observation
+void MPCNode::publishDiagnostics(double solve_time_ms, int solver_status) {
+    // Publish [solve_time_ms, is_reversal, n_dynamic_obs, solver_status] for RL agent observation
     std_msgs::Float64MultiArray diag;
-    diag.data.resize(3);
+    diag.data.resize(4);
     diag.data[0] = solve_time_ms;
     diag.data[1] = (mode_ == ControlMode::REVERSAL) ? 1.0 : 0.0;
     diag.data[2] = static_cast<double>(dynamic_obstacles_.size());
+    diag.data[3] = static_cast<double>(solver_status);
     pub_mpc_diagnostics_.publish(diag);
 }
 
@@ -345,7 +347,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 2. PREDICT DYNAMIC OBSTACLES (before mode detection)
     // =========================================================================
-    double Tf = 2.5;
+    double Tf = 2.0;
     double dt = Tf / N_;
     predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
     
@@ -540,10 +542,11 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 7. SOLVE
     // =========================================================================
+    
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
     
     if (status != 0) {
-        ROS_WARN("ACADOS solver failed with status %d", status);
+        ROS_WARN("[MPC] ACADOS solver failed with status %d", status);
         return false;
     }
     
@@ -688,6 +691,10 @@ void MPCNode::run() {
         // Combine obstacles
         std::vector<double> all_obs_x;
         std::vector<double> all_obs_y;
+        
+        // Reserve capacity to prevent repeated allocations
+        all_obs_x.reserve(map_x_.size() + dynamic_obstacles_.size() + 5);
+        all_obs_y.reserve(map_y_.size() + dynamic_obstacles_.size() + 5);
 
         // Add dynamic obstacles
         for (const auto& pred_obs : predicted_obstacles_) {
@@ -709,8 +716,9 @@ void MPCNode::run() {
         double solve_ms = std::chrono::duration<double, std::milli>(t_solve_end - t_solve_start).count();
         last_solve_time_ms_ = solve_ms;
         
-        // Publish diagnostics for RL weight tuner
-        publishDiagnostics(solve_ms);
+        // Publish diagnostics for RL weight tuner (now includes solver status)
+        int solver_status = success ? 0 : 1;
+        publishDiagnostics(solve_ms, solver_status);
         
         if (success) {
             publishVelocity(v_opt_, w_opt_);

@@ -85,7 +85,7 @@ private:
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
     void callbackMpcWeights(const std_msgs::Float64MultiArray::ConstPtr& msg);
-    void publishDiagnostics(double solve_time_ms);
+    void publishDiagnostics(double solve_time_ms, int solver_status);
     
     // MPC solver
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -145,7 +145,7 @@ private:
     double a_max_ = 3.0;          // Maximum acceleration [m/s^2]
     
     // MPC parameters
-    int N_ = 25;  // Prediction horizon
+    int N_ = 20;  // Prediction horizon
     int nx_ = 5;  // State dimension (5: x, y, theta, vr, vl)
     int nu_ = 2;  // Control dimension (2: ar, al)
     
@@ -187,7 +187,7 @@ private:
 
     double robot_radius_ = 0.35; // circumradius 
     double dynamic_obs_radius_ = 0.5;
-    double safety_margin_ = 0.1;
+    double safety_margin_ = 0.3;
 
     // RL weight tuning: last MPC solve time for diagnostics
     double last_solve_time_ms_ = 0.0;
