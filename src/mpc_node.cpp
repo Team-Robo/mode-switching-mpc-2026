@@ -145,6 +145,8 @@ void MPCNode::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
     
     for (; iter_x != iter_x.end(); ++iter_x, ++iter_y) {
+        // Skip NaN / inf points to prevent numerical issues in the solver
+        if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y)) continue;
         obs_x_.push_back(*iter_x);
         obs_y_.push_back(*iter_y);
     }
@@ -158,6 +160,8 @@ void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
     
     for (; iter_x != iter_x.end(); ++iter_x, ++iter_y) {
+        // Skip NaN / inf points to prevent numerical issues in the solver
+        if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y)) continue;
         map_x_.push_back(*iter_x);
         map_y_.push_back(*iter_y);
     }

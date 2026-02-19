@@ -36,8 +36,16 @@ public:
     
     void callbackLaserScan(const sensor_msgs::LaserScan::ConstPtr& msg) {
         std::lock_guard<std::mutex> lock(cloud_mutex_);
-        laser_scan = *msg;
-        laser_projector.projectLaser(*msg, point_cloud);
+        sensor_msgs::LaserScan filtered = *msg;
+        const float max_range = filtered.range_max;
+        for (float& r : filtered.ranges) {
+            if (!std::isfinite(r) || r < filtered.range_min) {
+                r = max_range;
+            }
+        }
+
+        laser_scan = filtered;
+        laser_projector.projectLaser(filtered, point_cloud);
         has_new_data_ = true;
     }
     
@@ -98,6 +106,12 @@ public:
         
         for (; iter_x != iter_x.end(); ++iter_x, ++iter_y, ++iter_z) {
             if (count % SCAN_SPACING == 0) {
+                // Safety net: skip any residual NaN / inf after the scan filter
+                if (!std::isfinite(*iter_x) || !std::isfinite(*iter_y) || !std::isfinite(*iter_z)) {
+                    count++;
+                    continue;
+                }
+
                 // Point in laser frame
                 tf::Vector3 p_laser(*iter_x, *iter_y, *iter_z);
                 
