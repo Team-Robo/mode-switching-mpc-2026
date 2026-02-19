@@ -20,12 +20,15 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     nh_private_.param<double>("weight_position_error", weight_position_error_, 49.0);
     nh_private_.param<double>("weight_heading_error", weight_heading_error_, 37.0);
+    nh_private_.param<double>("weight_velocity", weight_velocity_, 10.0);
+    nh_private_.param<double>("v_ref", v_ref_, 2.0);
     nh_private_.param<double>("weight_acceleration", weight_acceleration_, 0.0021);
     
     ROS_INFO("MPC Parameters: N=%d, v_linear_max=%.2f m/s, SAFE_DISTANCE=%.2f m",
              N_, v_linear_max_, SAFE_DISTANCE);
-    ROS_INFO("MPC Weights: pos=%.2f, heading=%.2f, accel=%.2f",
-             weight_position_error_, weight_heading_error_, weight_acceleration_);
+    ROS_INFO("MPC Weights: pos=%.2f, heading=%.2f, vel=%.2f, accel=%.2f",
+             weight_position_error_, weight_heading_error_,
+             weight_velocity_, weight_acceleration_);
     ROS_INFO("Reversal: threshold=%.2f, angle=%.1f deg",
              reversal_threshold_, reversal_angle_deg_);
     
@@ -325,7 +328,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 2. PREDICT DYNAMIC OBSTACLES (before mode detection)
     // =========================================================================
-    double Tf = 2.5;
+    double Tf = 2.0;
     double dt = Tf / N_;
     predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
     
@@ -399,14 +402,16 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     // 5. UPDATE COST WEIGHTS (W Matrix)
     // =========================================================================
-    int ny = 3 + nu_;   // 5: [x, y, theta, ar, al]
+    int ny = ny_;   // 7: [x, y, theta, vr, vl, ar, al]
     std::vector<double> W(ny * ny, 0.0);
 
     W[0 * ny + 0] = weight_position_error_;   // x
     W[1 * ny + 1] = weight_position_error_;   // y
     W[2 * ny + 2] = weight_heading_error_;    // theta
-    W[3 * ny + 3] = effective_accel_weight;   // ar
-    W[4 * ny + 4] = effective_accel_weight;   // al
+    W[3 * ny + 3] = weight_velocity_;         // vr
+    W[4 * ny + 4] = weight_velocity_;         // vl
+    W[5 * ny + 5] = effective_accel_weight;   // ar
+    W[6 * ny + 6] = effective_accel_weight;   // al
 
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
@@ -427,18 +432,22 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
         // --- Cost reference ---
         if (i < N_) {
-            double y_ref_stage[5];
+            double y_ref_stage[7];
             y_ref_stage[0] = stage_x;
             y_ref_stage[1] = stage_y;
             y_ref_stage[2] = stage_theta;
-            y_ref_stage[3] = 0.0;   // ar reference = 0 (minimise acceleration)
-            y_ref_stage[4] = 0.0;   // al reference = 0
+            y_ref_stage[3] = v_ref_;  // vr reference
+            y_ref_stage[4] = v_ref_;  // vl reference
+            y_ref_stage[5] = 0.0;     // ar reference = 0
+            y_ref_stage[6] = 0.0;     // al reference = 0
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
         } else {
-            double y_ref_e[3];
+            double y_ref_e[5];
             y_ref_e[0] = stage_x;
             y_ref_e[1] = stage_y;
             y_ref_e[2] = stage_theta;
+            y_ref_e[3] = v_ref_;  // vr terminal reference
+            y_ref_e[4] = v_ref_;  // vl terminal reference
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
         }
 

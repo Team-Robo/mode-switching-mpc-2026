@@ -103,62 +103,50 @@ def setup_acados_ocp():
     # Dimensions
     nx = 5  # state dimension
     nu = 2  # control dimension
-    ny = 3 + nu  # output dimension for cost (only x, y, theta)
-    N = 25  # prediction horizon
+    ny = 5 + nu  # output dimension for cost: [x, y, theta, vr, vl, ar, al]
+    N = 20  # prediction horizon
     
-    Tf = 2.5  # [s]
+    Tf = 2.0  # [s]
     ocp.solver_options.tf = Tf
     
     # Cost matrices
-    Q = np.diag([49.0, 49.0, 37.0])  # [x, y, theta] - theta weight adjustable
-    R = np.diag([0.0021, 0.0021]) # control weights [ar, al]
+    Q = np.diag([49.0, 49.0, 37.0, 10.0, 10.0])  # [x, y, theta, vr, vl]
+    R = np.diag([0.0021, 0.0021])  # control weights [ar, al]
     
     # Terminal cost
-    Q_e = np.diag([49.0, 49.0, 37.0])  # [x, y, theta] - terminal heading weight
+    Q_e = np.diag([49.0, 49.0, 37.0, 10.0, 10.0])  # [x, y, theta, vr, vl]
     
     # Set cost
     ocp.cost.cost_type = 'LINEAR_LS'
     ocp.cost.cost_type_e = 'LINEAR_LS'
-    
-    # # Stage cost
-    # ocp.cost.W = np.block([[Q, np.zeros((nx, nu))],
-    #                         [np.zeros((nu, nx)), R]])
-    
-    # # ny = nx + nu  # output dimension
-    # ocp.cost.Vx = np.zeros((ny, nx))
-    # ocp.cost.Vx[:nx, :nx] = np.eye(nx)
-    # ocp.cost.Vu = np.zeros((ny, nu))
-    # ocp.cost.Vu[nx:, :] = np.eye(nu)
 
-    ocp.cost.W = np.block([[Q, np.zeros((3, nu))], 
-                            [np.zeros((nu, 3)), R]])
-    
-    # Vx matrix: select which states to track (only first 3: x, y, theta)
+    ocp.cost.W = np.block([[Q, np.zeros((5, nu))],
+                            [np.zeros((nu, 5)), R]])
+
+    # Vx: directly select x, y, theta, vr, vl from state
     ocp.cost.Vx = np.zeros((ny, nx))
-    ocp.cost.Vx[0, 0] = 1.0  # track x
-    ocp.cost.Vx[1, 1] = 1.0  # track y
-    ocp.cost.Vx[2, 2] = 1.0  # track theta
+    ocp.cost.Vx[0, 0] = 1.0  # x
+    ocp.cost.Vx[1, 1] = 1.0  # y
+    ocp.cost.Vx[2, 2] = 1.0  # theta
+    ocp.cost.Vx[3, 3] = 1.0  # vr
+    ocp.cost.Vx[4, 4] = 1.0  # vl
 
     ocp.cost.Vu = np.zeros((ny, nu))
-    ocp.cost.Vu[3:, :] = np.eye(nu)  # controls start at index 3 now
+    ocp.cost.Vu[5:, :] = np.eye(nu)  # ar, al start at index 5
 
     # Reference (will be set online)
     ocp.cost.yref = np.zeros(ny)
 
-    # Terminal cost - only position/heading
+    # Terminal cost - position, heading, and wheel velocities
     ocp.cost.W_e = Q_e
-    ocp.cost.Vx_e = np.zeros((3, nx))
+    ocp.cost.Vx_e = np.zeros((5, nx))
     ocp.cost.Vx_e[0, 0] = 1.0  # x
     ocp.cost.Vx_e[1, 1] = 1.0  # y
     ocp.cost.Vx_e[2, 2] = 1.0  # theta
-    ocp.cost.yref_e = np.zeros(3)  # [x_ref, y_ref, theta_ref]
+    ocp.cost.Vx_e[3, 3] = 1.0  # vr
+    ocp.cost.Vx_e[4, 4] = 1.0  # vl
+    ocp.cost.yref_e = np.zeros(5)  # [x_ref, y_ref, theta_ref, vr_ref, vl_ref]
 
-    
-    # # Terminal cost
-    # ocp.cost.W_e = Q_e
-    # ocp.cost.Vx_e = np.eye(nx)
-    # ocp.cost.yref_e = np.zeros(nx)
-    
     # Constraints
     # State constraints (only for vr and vl)
     ocp.constraints.idxbx = np.array([3, 4])  # constrain vr, vl

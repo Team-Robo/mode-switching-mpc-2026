@@ -138,9 +138,10 @@ private:
     double a_max_ = 3.0;          // Maximum acceleration [m/s^2]
     
     // MPC parameters
-    int N_ = 25;  // Prediction horizon
+    int N_ = 20;  // Prediction horizon
     int nx_ = 5;  // State dimension (5: x, y, theta, vr, vl)
     int nu_ = 2;  // Control dimension (2: ar, al)
+    int ny_ = 7;  // Output dimension (7: x, y, theta, vr, vl, ar, al)
     
     // Current state [x, y, theta, vr, vl]
     std::vector<double> current_state_;
@@ -172,6 +173,8 @@ private:
     
     double weight_position_error_ = 24.0;
     double weight_heading_error_ = 29.0;
+    double weight_velocity_ = 10.0;
+    double v_ref_ = 2.0;
     double weight_acceleration_ = 0.0021;
     // Tuning parameters
     double reversal_threshold_ = 0.7;  // Fraction of waypoints that must be backwards to trigger reversal
