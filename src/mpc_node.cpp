@@ -3,6 +3,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <algorithm>
 #include <limits>
+#include <sstream>
 
 // mpc_node.cpp
 
@@ -13,8 +14,10 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     
     // Load parameters from parameter server
     nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);
-    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.5);
-    nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
+    nh_private_.param<double>("reversal_threshold",  reversal_threshold_,  0.65);
+    nh_private_.param<double>("reversal_angle_deg",   reversal_angle_deg_,   75.0);
+    nh_private_.param<int>   ("reversal_hold_cycles", reversal_hold_cycles_, 15);
+    nh_private_.param<double>("reversal_slack",       reversal_slack_,       0.5);
     nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.6);
     nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.25);
     
@@ -29,8 +32,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("MPC Weights: pos=%.2f, heading=%.2f, vel=%.2f, accel=%.2f",
              weight_position_error_, weight_heading_error_,
              weight_velocity_, weight_acceleration_);
-    ROS_INFO("Reversal: threshold=%.2f, angle=%.1f deg",
-             reversal_threshold_, reversal_angle_deg_);
+    ROS_INFO("Reversal: threshold=%.2f, angle=%.1f deg, slack=%.2f",
+             reversal_threshold_, reversal_angle_deg_, reversal_slack_);
     
     // Initialize publishers
     pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
@@ -44,6 +47,14 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
     sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10, &MPCNode::callbackTrackDynamicObstacle, this);
+    sub_weight_update_ = nh_.subscribe("/mpc/weight_update", 1, &MPCNode::callbackWeightUpdate, this);
+
+    // Verbose mode for RL training monitoring
+    nh_private_.param<bool>("mpc_verbose", mpc_verbose_, false);
+    if (mpc_verbose_) {
+        pub_verbose_ = nh_.advertise<std_msgs::String>("/mpc/verbose", 1);
+        ROS_INFO("MPC verbose mode enabled — publishing to /mpc/verbose");
+    }
 
     // Initialize state
     current_state_.resize(nx_, 0.0);
@@ -186,6 +197,21 @@ void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::C
     ROS_INFO("Received %lu dynamic obstacles", dynamic_obstacles_.size());
 }
 
+void MPCNode::callbackWeightUpdate(const std_msgs::Float64MultiArray::ConstPtr& msg) {
+    if (msg->data.size() >= 4) {
+        weight_position_error_ = std::max(1.0,    std::min(100.0, msg->data[0]));
+        weight_heading_error_  = std::max(1.0,    std::min(100.0, msg->data[1]));
+        weight_velocity_       = std::max(0.1,    std::min(50.0,  msg->data[2]));
+        weight_acceleration_   = std::max(0.0001, std::min(1.0,   msg->data[3]));
+
+        if (mpc_verbose_) {
+            ROS_INFO("RL weight update: pos=%.2f  head=%.2f  vel=%.2f  accel=%.6f",
+                     weight_position_error_, weight_heading_error_,
+                     weight_velocity_, weight_acceleration_);
+        }
+    }
+}
+
 // =============================================================================
 // Utility
 // =============================================================================
@@ -203,9 +229,11 @@ double MPCNode::headingPreprocess(double center, double target) {
 }
 
 double MPCNode::diffAngle(double a1, double a2) {
-    double diff = std::max(a1, a2) - std::min(a1, a2);
-    if (diff > M_PI) diff = 2.0 * M_PI - diff;
-    return diff;
+    // Works correctly even when a1/a2 are unwrapped (outside [-pi,pi]) because
+    // headingPreprocess can produce values like 4.7 or -5.1 for continuity.
+    double d = std::fmod(std::abs(a1 - a2), 2.0 * M_PI);
+    if (d > M_PI) d = 2.0 * M_PI - d;
+    return d;
 }
 
 bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
@@ -218,43 +246,61 @@ bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) 
 bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
                                    double current_theta) {
     if (theta_ref.empty()) return false;
-    
+
+    double angle_threshold_rad = reversal_angle_deg_ * M_PI / 180.0;
     int count  = 0;
     int length = std::min(static_cast<int>(theta_ref.size()), N_);
-    double angle_threshold_rad = reversal_angle_deg_ * M_PI / 180.0;
-    
+
     for (int i = 1; i < length; ++i) {
         if (diffAngle(current_theta, theta_ref[i]) > angle_threshold_rad) {
             count++;
         }
     }
-    
+
     return (static_cast<double>(count) / length) > reversal_threshold_;
 }
 
 std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x_ref,
                                                      const std::vector<double>& y_ref,
                                                      double current_theta) {
+    // Car-like reversal: the robot keeps its CURRENT heading while driving backward.
+    // We allow gentle curvature along the path, but anchor tightly to current_theta
+    // so the solver does NOT try to spin the robot 180° before backing up.
+    // The position cost handles lateral steering; heading keeps the body stable.
     std::vector<double> reverse_theta;
-    if (x_ref.size() < 2) return reverse_theta;
-    
-    double center_heading = current_theta;
-    
-    for (size_t i = 0; i < std::min(static_cast<size_t>(N_), x_ref.size() - 1); ++i) {
-        double dx = x_ref[i] - x_ref[i + 1]; 
-        double dy = y_ref[i] - y_ref[i + 1];
-        double theta = std::atan2(dy, dx);
-        double theta_preprocessed = headingPreprocess(center_heading, theta);
-        reverse_theta.push_back(theta_preprocessed);
-        center_heading = theta_preprocessed;
+    if (x_ref.size() < 2) {
+        for (int i = 0; i <= N_; ++i) reverse_theta.push_back(current_theta);
+        return reverse_theta;
     }
-    
+
+    // Compute the backward-facing path heading but clamp each step to stay
+    // within ±max_heading_drift of current_theta so the robot never tries
+    // to rotate far from its entry orientation.
+    const double max_heading_drift = 25.0 * M_PI / 180.0;  // 25° max drift from entry
+    double center_heading = current_theta;
+
+    for (size_t i = 0; i < std::min(static_cast<size_t>(N_), x_ref.size() - 1); ++i) {
+        double dx = x_ref[i] - x_ref[i + 1];  // backward direction
+        double dy = y_ref[i] - y_ref[i + 1];
+        double raw_theta = std::atan2(dy, dx);
+        double theta = headingPreprocess(center_heading, raw_theta);
+        // Clamp: do not deviate more than max_heading_drift from current_theta
+        double drift = theta - current_theta;
+        if (drift >  max_heading_drift) theta = current_theta + max_heading_drift;
+        if (drift < -max_heading_drift) theta = current_theta - max_heading_drift;
+        reverse_theta.push_back(theta);
+        center_heading = theta;
+    }
+
     if (!reverse_theta.empty()) {
         reverse_theta.push_back(reverse_theta.back());
     }
-    
+
     return reverse_theta;
 }
+
+
+
 
 void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
                                const std::vector<double>& y_ref,
@@ -369,19 +415,36 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_INFO_THROTTLE(2.0, "Obstacles detected (closest: %.2fm)", closest_obstacle_dist);
     }
     
-    // --- Reversal logic ---
+    // --- Reversal logic with hysteresis and minimum hold time ---
     std::vector<double> effective_theta_ref = theta_ref;
-    
-    if (checkReversalNeeded(theta_ref, current_state[2])) {
-        mode_ = ControlMode::REVERSAL;
-        reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
-        effective_theta_ref = reverse_theta_ref_;
-        display_text_ = "REVERSAL";
-        ROS_INFO_THROTTLE(1.0, "Reversal mode activated");
+
+    if (mode_ == ControlMode::REVERSAL) {
+        // Decrement mandatory hold counter
+        if (reversal_hold_counter_ > 0) --reversal_hold_counter_;
+
+        // Only consider exiting once hold period is over AND entry condition no longer holds
+        if (reversal_hold_counter_ == 0 && !checkReversalNeeded(theta_ref, current_state[2])) {
+            mode_ = ControlMode::NORMAL;
+            display_text_ = "NORMAL";
+            ROS_INFO_THROTTLE(1.0, "Reversal mode deactivated — path aligned");
+        } else {
+            // Stay in reversal
+            reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
+            effective_theta_ref = reverse_theta_ref_;
+            display_text_ = "REVERSAL";
+        }
     } else {
-        mode_ = ControlMode::NORMAL;
-        display_text_ = "NORMAL";
-        ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
+        if (checkReversalNeeded(theta_ref, current_state[2])) {
+            mode_ = ControlMode::REVERSAL;
+            reversal_hold_counter_ = reversal_hold_cycles_;
+            reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
+            effective_theta_ref = reverse_theta_ref_;
+            display_text_ = "REVERSAL";
+            ROS_INFO_THROTTLE(1.0, "Reversal mode activated");
+        } else {
+            display_text_ = "NORMAL";
+            ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
+        }
     }
 
     // =========================================================================
@@ -431,23 +494,26 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         double stage_theta = effective_theta_ref[theta_ref_idx];
 
         // --- Cost reference ---
+        // In REVERSAL mode both wheels must spin backwards → negate v_ref, scaled by reversal_slack
+        double effective_v_ref = (mode_ == ControlMode::REVERSAL) ? -v_ref_ * reversal_slack_ : v_ref_;
+
         if (i < N_) {
             double y_ref_stage[7];
             y_ref_stage[0] = stage_x;
             y_ref_stage[1] = stage_y;
             y_ref_stage[2] = stage_theta;
-            y_ref_stage[3] = v_ref_;  // vr reference
-            y_ref_stage[4] = v_ref_;  // vl reference
-            y_ref_stage[5] = 0.0;     // ar reference = 0
-            y_ref_stage[6] = 0.0;     // al reference = 0
+            y_ref_stage[3] = effective_v_ref;  // vr reference
+            y_ref_stage[4] = effective_v_ref;  // vl reference
+            y_ref_stage[5] = 0.0;              // ar reference = 0
+            y_ref_stage[6] = 0.0;              // al reference = 0
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
         } else {
             double y_ref_e[5];
             y_ref_e[0] = stage_x;
             y_ref_e[1] = stage_y;
             y_ref_e[2] = stage_theta;
-            y_ref_e[3] = v_ref_;  // vr terminal reference
-            y_ref_e[4] = v_ref_;  // vl terminal reference
+            y_ref_e[3] = effective_v_ref;  // vr terminal reference
+            y_ref_e[4] = effective_v_ref;  // vl terminal reference
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
         }
 
@@ -702,6 +768,24 @@ void MPCNode::run() {
             w_opt_ = 0.0;
             publishVelocity(0.0, 0.0);
             ROS_WARN("MPC solve failed, stopping");
+        }
+
+        // ── Verbose JSON for RL training monitoring ──────────────────
+        if (mpc_verbose_ && pub_verbose_.getNumSubscribers() > 0) {
+            std_msgs::String vmsg;
+            std::ostringstream ss;
+            ss << "{\"t\":"    << ros::Time::now().toSec()
+               << ",\"w_pos\":"  << weight_position_error_
+               << ",\"w_head\":" << weight_heading_error_
+               << ",\"w_vel\":"  << weight_velocity_
+               << ",\"w_accel\":" << weight_acceleration_
+               << ",\"mode\":\"" << display_text_ << "\""
+               << ",\"v\":"     << v_opt_
+               << ",\"w\":"     << w_opt_
+               << ",\"ok\":"    << (success ? "true" : "false")
+               << "}";
+            vmsg.data = ss.str();
+            pub_verbose_.publish(vmsg);
         }
         
     } catch (const std::exception& e) {

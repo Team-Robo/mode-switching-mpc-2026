@@ -11,6 +11,7 @@
 #include <visualization_msgs/Marker.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/Float64MultiArray.h>
+#include <std_msgs/String.h>
 #include <obstacle_detector/Obstacles.h>
 #include <vector>
 #include <string>
@@ -62,6 +63,7 @@ private:
     ros::Publisher pub_vel_;
     ros::Publisher pub_mpc_plan_;
     ros::Publisher pub_marker_;
+    ros::Publisher pub_verbose_;   // MPC verbose JSON (/mpc/verbose)
 
     // Mutex for solver
     std::mutex solver_mutex_;
@@ -72,6 +74,7 @@ private:
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     ros::Subscriber sub_dynamic_obstacle_;
+    ros::Subscriber sub_weight_update_;  // RL weight updates (/mpc/weight_update)
     
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
@@ -79,6 +82,7 @@ private:
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
+    void callbackWeightUpdate(const std_msgs::Float64MultiArray::ConstPtr& msg);
     
     // MPC solver
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -177,9 +181,15 @@ private:
     double v_ref_ = 2.0;
     double weight_acceleration_ = 0.0021;
     // Tuning parameters
-    double reversal_threshold_ = 0.7;  // Fraction of waypoints that must be backwards to trigger reversal
-    double reversal_angle_deg_ = 90.0; // Angle threshold (degrees) to consider a waypoint "backwards"
+    double reversal_threshold_ = 0.7;   // Fraction of waypoints that must be backwards to trigger/exit reversal
+    double reversal_angle_deg_ = 90.0;  // Angle threshold (degrees) for reversal detection
+    int    reversal_hold_cycles_ = 15;  // Minimum MPC cycles to stay in REVERSAL before checking exit
+    int    reversal_hold_counter_ = 0;  // Counts down remaining mandatory reversal cycles
+    double reversal_slack_ = 0.5;       // Scale factor [0,1] applied to v_ref_ in REVERSAL mode
     double obs_search_radius_ = 4.0;  
+
+    // RL / verbose
+    bool mpc_verbose_ = false;
 
     double robot_radius_ = 0.35; // circumradius 
     double dynamic_obs_radius_ = 0.5;
