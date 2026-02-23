@@ -235,6 +235,147 @@ std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
 }
 
 // =============================================================================
+// selectTwoObstacles
+// =============================================================================
+//   slot1 = CLOSEST obstacle (by effective distance, accounting for radius)
+//   slot2 = SECOND CLOSEST obstacle that is NOT collinear with slot1
+//           (angular separation > collinearity_thresh_rad from slot1)
+//
+// Why two non-collinear obstacles?
+//   ACADOS minimises a smooth NLP. If slot1 and slot2 point to the same
+//   (or nearly same) location the Hessian for the distance constraints
+//   becomes rank-deficient and the solver effectively sees one constraint,
+//   not two. Enforcing angular separation gives the solver two independent
+//   repulsion directions — critical in corridors where walls are on both
+//   sides, and in dynamic scenes where two pedestrians approach from
+//   different angles.
+//
+// The 3rd-obstacle emergency brake (checkEmergencyStop) is a separate,
+// pure C++ safety net that does NOT go through ACADOS at all.
+// =============================================================================
+void MPCNode::selectTwoObstacles(
+    const std::vector<double>& obs_x,
+    const std::vector<double>& obs_y,
+    const std::vector<PredictedObstacle>& predicted_obstacles,
+    double rx, double ry,
+    int stage,
+    double search_radius_sq,
+    double p_data[4]) const
+{
+    // Angular separation threshold to consider two obstacles "different enough"
+    // to warrant using both ACADOS slots independently.
+    // 30° gives good separation without being too strict in dense scenes.
+    constexpr double collinearity_thresh_rad = 30.0 * M_PI / 180.0;
+
+    struct Candidate {
+        double x, y;
+        double eff_dist;
+        double angle; 
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(obs_x.size() + predicted_obstacles.size());
+
+    for (size_t j = 0; j < obs_x.size(); ++j) {
+        double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
+        double d2 = dx*dx + dy*dy;
+        if (d2 > search_radius_sq) continue;
+        double d = std::sqrt(d2);
+        candidates.push_back({obs_x[j], obs_y[j], d, std::atan2(dy, dx)});
+    }
+
+    for (const auto& pred : predicted_obstacles) {
+        if (stage >= static_cast<int>(pred.x_predicted.size())) continue;
+        double px = pred.x_predicted[stage];
+        double py = pred.y_predicted[stage];
+        double pr = pred.radius_predicted[stage];
+        double dx = px - rx, dy = py - ry;
+        double dist_center = std::sqrt(dx*dx + dy*dy);
+        if (dist_center > obs_search_radius_) continue;
+        double eff_dist = std::max(0.0, dist_center - pr);
+        candidates.push_back({px, py, eff_dist, std::atan2(dy, dx)});
+    }
+
+    if (candidates.empty()) {
+        // Nothing nearby — park both slots far away so constraints are inactive
+        p_data[0] = p_data[2] = 1000.0;
+        p_data[1] = p_data[3] = 1000.0;
+        return;
+    }
+
+    // Sort by effective distance ascending — closest first
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b){
+                  return a.eff_dist < b.eff_dist;
+              });
+
+    // Slot 1: always the closest obstacle
+    p_data[0] = candidates[0].x;
+    p_data[1] = candidates[0].y;
+
+    if (candidates.size() == 1) {
+        // Only one obstacle — mirror into slot 2 (same point, harmless: same constraint)
+        p_data[2] = candidates[0].x;
+        p_data[3] = candidates[0].y;
+        return;
+    }
+
+    // Slot 2: closest obstacle that is NOT collinear with slot 1
+    // This prevents rank-deficiency in the ACADOS constraint Jacobian and ensures
+    // the solver gets two independent repulsion directions.
+    bool found_slot2 = false;
+    for (size_t k = 1; k < candidates.size(); ++k) {
+        double angle_diff = std::fabs(candidates[k].angle - candidates[0].angle);
+        // Wrap to [0, pi]
+        if (angle_diff > M_PI) angle_diff = 2.0*M_PI - angle_diff;
+        if (angle_diff > collinearity_thresh_rad) {
+            p_data[2] = candidates[k].x;
+            p_data[3] = candidates[k].y;
+            found_slot2 = true;
+            break;
+        }
+    }
+
+    if (!found_slot2) {
+        p_data[2] = candidates[1].x;
+        p_data[3] = candidates[1].y;
+    }
+}
+
+// =============================================================================
+// checkEmergencyStop — handles the 3rd+ obstacle that ACADOS cannot see
+// =============================================================================
+// ACADOS only receives 2 obstacle slots. If a 3rd dynamic obstacle is closer
+// than the hard stop threshold we cannot trust the NLP to avoid it — so we
+// command zero velocity directly from C++ before even calling the solver.
+// Returns true if the robot must stop immediately.
+// =============================================================================
+bool MPCNode::checkEmergencyStop(
+    const std::vector<PredictedObstacle>& predicted_obstacles,
+    const std::vector<double>& current_state) const
+{
+    const double hard_stop_dist = robot_radius_ + dynamic_obs_radius_ + 0.3;
+
+    int slot = 0;
+    for (const auto& pred : predicted_obstacles) {
+        if (pred.x_predicted.empty()) continue;
+        double dx   = pred.x_predicted[0] - current_state[0];
+        double dy   = pred.y_predicted[0] - current_state[1];
+        double dist = std::sqrt(dx*dx + dy*dy) - pred.radius_predicted[0];
+        if (dist < hard_stop_dist) {
+            ++slot;
+            if (slot > 2) {
+                ROS_WARN_THROTTLE(0.5,
+                    "Emergency stop: 3rd+ dynamic obstacle at %.2fm (threshold %.2fm)",
+                    dist, hard_stop_dist);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// =============================================================================
 // OCP Solver
 // =============================================================================
 bool MPCNode::solveOCP(const std::vector<double>& x_ref,
@@ -260,7 +401,15 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
 
     // =========================================================================
-    // 3. MODE DETECTION
+    // 3. EMERGENCY STOP CHECK — must happen before mode detection
+    //    Handles 3rd+ dynamic obstacle that ACADOS cannot see.
+    // =========================================================================
+    if (checkEmergencyStop(predicted_obstacles_, current_state)) {
+        return false;  // caller publishes zero velocity
+    }
+
+    // =========================================================================
+    // 4. MODE DETECTION
     // =========================================================================
     bool has_dynamic_obs = false;
     double closest_dynamic_dist = std::numeric_limits<double>::max();
@@ -298,7 +447,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 4. MODE-SPECIFIC CONFIG
+    // 5. MODE-SPECIFIC CONFIG
     // =========================================================================
     double v_cap = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
 
@@ -308,7 +457,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     double effective_accel_weight = weight_acceleration_ * accel_mult;
 
     // =========================================================================
-    // 5. REVERSAL OVERLAY
+    // 6. REVERSAL OVERLAY
     // =========================================================================
     std::vector<double> effective_theta_ref = theta_ref;
     in_reversal_ = checkReversalNeeded(theta_ref, current_state[2]);
@@ -320,7 +469,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 6. CONSTRAINT BOUNDS
+    // 7. CONSTRAINT BOUNDS
     // =========================================================================
     double min_dist_sq;
     if (mode_ == ControlMode::DYNAMIC_OBS) {
@@ -337,7 +486,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 7. COST WEIGHTS — ny = 6: [x, y, theta, v_linear, ar, al]
+    // 8. COST WEIGHTS — ny = 6: [x, y, theta, v_linear, ar, al]
     // =========================================================================
     int ny = 4 + nu_;  // 6
     std::vector<double> W(ny * ny, 0.0);
@@ -352,7 +501,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
 
     // =========================================================================
-    // 8. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
+    // 9. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
     // =========================================================================
     double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
@@ -364,26 +513,18 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         double sy = y_ref[ref_idx];
         double st = effective_theta_ref[theta_idx];
 
-        // -----------------------------------------------------------------
-        // FIX 3: Use predicted robot state for obstacle geometry, not the
-        // reference waypoint. At stage 0 we use current_state directly;
-        // for i > 0 we pull from the previous solve's warm-start trajectory.
-        // This means left/right classification and distance checks reflect
-        // where the robot will actually be, not where the path is.
-        // -----------------------------------------------------------------
-        double rx, ry, rt;
+        double rx, ry;
         if (i == 0) {
             rx = current_state[0];
             ry = current_state[1];
-            rt = current_state[2];
         } else {
             double xs[5];
             ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
             rx = xs[0];
             ry = xs[1];
-            rt = xs[2];
         }
 
+        // Set stage reference
         if (i < N_) {
             double v_ref = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
             double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
@@ -393,45 +534,16 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        // --- Closest left/right obstacles relative to predicted robot pose ---
-        double obs_L[2] = {1000.0, 1000.0};
-        double obs_R[2] = {1000.0, 1000.0};
-        double min_dL = std::numeric_limits<double>::max();
-        double min_dR = std::numeric_limits<double>::max();
+        double p_data[4];
+        selectTwoObstacles(obs_x, obs_y, predicted_obstacles_,
+                           rx, ry, i, search_radius_sq, p_data);
 
-        for (size_t j = 0; j < obs_x.size(); ++j) {
-            double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
-            double d2 = dx*dx + dy*dy;
-            if (d2 > search_radius_sq) continue;
-            if (isLeft(rx, ry, rt, obs_x[j], obs_y[j])) {
-                if (d2 < min_dL) { min_dL = d2; obs_L[0] = obs_x[j]; obs_L[1] = obs_y[j]; }
-            } else {
-                if (d2 < min_dR) { min_dR = d2; obs_R[0] = obs_x[j]; obs_R[1] = obs_y[j]; }
-            }
-        }
-
-        for (const auto& pred : predicted_obstacles_) {
-            if (i >= static_cast<int>(pred.x_predicted.size())) continue;
-            double px = pred.x_predicted[i], py = pred.y_predicted[i];
-            double pr = pred.radius_predicted[i];
-            double dx = px - rx, dy = py - ry;
-            double dist_center = std::sqrt(dx*dx + dy*dy);
-            if (dist_center > obs_search_radius_) continue;
-            double eff_d2 = (dist_center - pr) * (dist_center - pr);
-            if (isLeft(rx, ry, rt, px, py)) {
-                if (eff_d2 < min_dL) { min_dL = eff_d2; obs_L[0] = px; obs_L[1] = py; }
-            } else {
-                if (eff_d2 < min_dR) { min_dR = eff_d2; obs_R[0] = px; obs_R[1] = py; }
-            }
-        }
-
-        double p_data[4] = { obs_L[0], obs_L[1], obs_R[0], obs_R[1] };
         if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0)
             jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
     }
 
     // =========================================================================
-    // 9. SOLVE
+    // 10. SOLVE
     // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
     if (status != 0) {
@@ -440,7 +552,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 10. EXTRACT SOLUTION
+    // 11. EXTRACT SOLUTION
     // =========================================================================
     double x_opt[5];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 1, "x", x_opt);

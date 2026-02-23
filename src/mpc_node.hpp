@@ -126,6 +126,27 @@ private:
         const std::vector<DynamicObstacle>& obstacles, double dt, int N);
 
     // =========================================================================
+    // Obstacle selection — replaces L/R binary classification
+    // =========================================================================
+    // Selects the 2 best obstacles to fill the ACADOS parameter slots at each
+    // stage. "Best" means: slot1 = closest, slot2 = closest with >30° angular
+    // separation from slot1 (to avoid constraint rank-deficiency in corridors).
+    // Both static and dynamic (predicted) obstacles are considered together.
+    void selectTwoObstacles(
+        const std::vector<double>& obs_x,
+        const std::vector<double>& obs_y,
+        const std::vector<PredictedObstacle>& predicted_obstacles,
+        double rx, double ry,
+        int stage,
+        double search_radius_sq,
+        double p_data[4]) const;
+
+    // Emergency stop for 3rd+ dynamic obstacle (invisible to ACADOS 2-slot model)
+    bool checkEmergencyStop(
+        const std::vector<PredictedObstacle>& predicted_obstacles,
+        const std::vector<double>& current_state) const;
+
+    // =========================================================================
     // Robot constants (fixed)
     // =========================================================================
     static constexpr double WHEELBASE = 0.37558;  // [m]
@@ -142,10 +163,8 @@ private:
     // =========================================================================
 
     // --- Velocity limits ---
-    // NORMAL + DYNAMIC_OBS: hard cap = v_linear_max_ (2.0 m/s max)
-    // STATIC_OBS:           hard cap = v_static_obs_max_ (tunable, lower)
     double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS
-    double v_static_obs_max_  = 1.0;   // [m/s] cap for STATIC_OBS — tune to meet nav metric
+    double v_static_obs_max_  = 1.0;   // [m/s] cap for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
 
     // --- Stage cost weights ---
@@ -153,25 +172,23 @@ private:
     double weight_heading_error_  = 37.0;
     double weight_acceleration_   = 0.0021;
     double weight_velocity_       = 10.0;
-    
-    // Accel weight is multiplied by these factors per mode to get smoother control
-    // near obstacles without slowing v directly in DYNAMIC mode
-    double accel_weight_mult_static_  = 5.0;  // STATIC_OBS multiplier
-    double accel_weight_mult_dynamic_ = 3.0;  // DYNAMIC_OBS multiplier
+
+    double accel_weight_mult_static_  = 5.0;
+    double accel_weight_mult_dynamic_ = 3.0;
 
     // --- Mode trigger distances ---
-    double static_obs_safe_dist_   = 1.25;  // [m] enter STATIC_OBS if static obs closer than this
-    double dynamic_obs_safe_dist_  = 2.5;   // [m] enter DYNAMIC_OBS if dynamic obs closer than this
+    double static_obs_safe_dist_   = 1.25;
+    double dynamic_obs_safe_dist_  = 2.5;
 
     // --- Obstacle geometry ---
-    double robot_radius_       = 0.35;   // [m] robot circumradius
-    double dynamic_obs_radius_ = 0.5;    // [m] assumed dynamic obstacle radius
-    double safety_margin_      = 0.1;    // [m] extra clearance on top of radii
-    double obs_search_radius_  = 4.0;    // [m] search radius for ACADOS per-stage obs params
+    double robot_radius_       = 0.35;
+    double dynamic_obs_radius_ = 0.5;
+    double safety_margin_      = 0.1;
+    double obs_search_radius_  = 4.0;
 
     // --- Reversal detection ---
-    double reversal_threshold_ = 0.7;   // fraction of N waypoints that must be "backwards"
-    double reversal_angle_deg_ = 90.0;  // angle threshold to call a waypoint "backwards" [deg]
+    double reversal_threshold_ = 0.7;
+    double reversal_angle_deg_ = 90.0;
 
     // =========================================================================
     // Runtime state
@@ -182,8 +199,8 @@ private:
     std::vector<double> x_ref_, y_ref_;
 
     std::vector<DynamicObstacle> dynamic_obstacles_;
-    std::vector<double> obs_x_, obs_y_;    // live lidar point-cloud obstacles
-    std::vector<double> map_x_, map_y_;    // static map obstacles
+    std::vector<double> obs_x_, obs_y_;
+    std::vector<double> map_x_, map_y_;
 
     ControlMode mode_        = ControlMode::NORMAL;
     bool        in_reversal_ = false;

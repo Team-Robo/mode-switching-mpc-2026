@@ -175,7 +175,7 @@ def setup_acados_ocp():
     ocp.solver_options.integrator_type   = 'ERK'
     ocp.solver_options.nlp_solver_type   = 'SQP_RTI'
     ocp.solver_options.nlp_solver_max_iter = 1
-    ocp.solver_options.qp_solver_iter_max  = 200
+    ocp.solver_options.qp_solver_iter_max  = 20
     ocp.solver_options.tol               = 1e-3
 
     ocp.code_export_directory = 'c_generated_code'
