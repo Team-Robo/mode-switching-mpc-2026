@@ -3,7 +3,6 @@
         <arg name="rviz" value="true"/>
         <arg name="tracker_bridge" value="false"/>
     </include>
-
     <!-- <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/> -->
 
     <!-- Start the navigation stack -->

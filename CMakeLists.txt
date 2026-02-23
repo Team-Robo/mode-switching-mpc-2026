@@ -146,33 +146,6 @@ add_dependencies(occupancy_to_cloud_node
     ${catkin_EXPORTED_TARGETS}
 )
 
-# SAC Weight Tuner Node (C++)
-# Bridge mode: receives weights from Python RL, validates, forwards to MPC
-# ONNX mode:   loads ONNX actor and runs inference (compile with -DUSE_ONNX_RUNTIME=ON)
-add_executable(weight_tuner_node
-    src/weight_tuner_node.cpp
-)
-target_link_libraries(weight_tuner_node
-    ${catkin_LIBRARIES}
-)
-add_dependencies(weight_tuner_node
-    ${${PROJECT_NAME}_EXPORTED_TARGETS}
-    ${catkin_EXPORTED_TARGETS}
-)
-
-# Optional ONNX Runtime support for C++ inference
-option(USE_ONNX_RUNTIME "Enable ONNX Runtime for SAC inference in weight_tuner_node" OFF)
-if(USE_ONNX_RUNTIME)
-    find_package(onnxruntime QUIET)
-    if(onnxruntime_FOUND)
-        target_compile_definitions(weight_tuner_node PRIVATE USE_ONNX_RUNTIME)
-        target_link_libraries(weight_tuner_node onnxruntime::onnxruntime)
-        message(STATUS "ONNX Runtime enabled for weight_tuner_node")
-    else()
-        message(WARNING "USE_ONNX_RUNTIME=ON but onnxruntime not found. Building without ONNX.")
-    endif()
-endif()
-
 # MPC node with ACADOS
 if(ACADOS_INSTALL_DIR)
     add_executable(mpc_node 
@@ -219,8 +192,6 @@ endif()
 
 catkin_install_python(PROGRAMS 
   script/generate_acados_solver.py
-  rl/train_sac.py
-  rl/barn_env.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
@@ -245,7 +216,6 @@ install(TARGETS
     inspection_node
     laser_scan_to_point_cloud_node
     occupancy_to_cloud_node
-    weight_tuner_node
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
