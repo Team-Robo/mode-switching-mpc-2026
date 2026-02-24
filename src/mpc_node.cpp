@@ -24,7 +24,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("accel_weight_mult_dynamic",  accel_weight_mult_dynamic_, 5.5);
 
     nh_private_.param<double>("static_obs_safe_dist",  static_obs_safe_dist_,  1.1);
-    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 2.7);
+    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 3.0);
 
     nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
     nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
@@ -685,7 +685,7 @@ int main(int argc, char** argv) {
     ros::NodeHandle nh_private("~");
     mpc_controller::MPCNode mpc_node(nh, nh_private);
     double mpc_rate = 30.0;
-    nh_private.param<double>("mpc_rate", mpc_rate, 30.0);
+    nh_private.param<double>("mpc_rate", mpc_rate, 25.0);
     ros::Rate rate(mpc_rate);
     ros::Duration(1.0).sleep();
     ROS_INFO("Non-Linear MPC Node running at %.1f Hz", mpc_rate);
