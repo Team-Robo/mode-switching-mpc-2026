@@ -164,8 +164,9 @@ private:
 
     // --- Velocity limits ---
     double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS
-    double v_static_obs_max_  = 1.0;   // [m/s] cap for STATIC_OBS
+    double v_static_obs_max_  = 0.9;   // [m/s] cap for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
+    double omega_static_obs_max_ = 0.8; // [rad/s] cap for STATIC_OBS
 
     // --- Stage cost weights ---
     double weight_position_error_ = 49.0;

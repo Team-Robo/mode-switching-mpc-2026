@@ -12,8 +12,9 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private)
 {
     nh_private_.param<double>("v_linear_max",      v_linear_max_,      2.0);
-    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  0.9);
+    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  0.5);
     nh_private_.param<double>("omega_max",          omega_max_,         1.8);
+    nh_private_.param<double>("omega_static_obs_max", omega_static_obs_max_, 0.8);
 
     nh_private_.param<double>("weight_position_error",  weight_position_error_,  130.0);
     nh_private_.param<double>("weight_heading_error",   weight_heading_error_,   49.0);
@@ -450,6 +451,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // 5. MODE-SPECIFIC CONFIG
     // =========================================================================
     double v_cap = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
+    double omega_cap = (mode_ == ControlMode::STATIC_OBS) ? omega_static_obs_max_ : omega_max_;
 
     double accel_mult = 1.0;
     if (mode_ == ControlMode::STATIC_OBS)  accel_mult = accel_weight_mult_static_;
@@ -477,8 +479,8 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     } else {
         min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
     }
-    double lh[4] = { -v_cap, -omega_max_, min_dist_sq, min_dist_sq };
-    double uh[4] = {  v_cap,  omega_max_, 1.0e9,       1.0e9 };
+    double lh[4] = { -v_cap, -omega_cap, min_dist_sq, min_dist_sq };
+    double uh[4] = {  v_cap,  omega_cap, 1.0e9,       1.0e9 };
 
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
