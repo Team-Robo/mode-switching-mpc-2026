@@ -3,6 +3,9 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <algorithm>
 #include <limits>
+#include <pcl/point_types.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/point_cloud.h>
 
 // mpc_node.cpp
 
@@ -29,7 +32,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
     nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
     nh_private_.param<double>("safety_margin",      safety_margin_,      0.01);
-    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  4.0);
+    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  1.5);
 
     nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
     nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
@@ -383,8 +386,10 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& theta_ref,
                        const std::vector<double>& current_state,
                        const std::vector<double>& obs_x,
-                       const std::vector<double>& obs_y)
+                       const std::vector<double>& obs_y
+                    )
 {
+    auto t0 = ros::WallTime::now(); 
     // =========================================================================
     // 1. INITIAL STATE CONSTRAINT
     // =========================================================================
@@ -500,33 +505,56 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     for (int i = 0; i < N_; ++i)
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
 
+    // 9. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS (KD-Tree accelerated)
     // =========================================================================
-    // 9. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
-    // =========================================================================
-    double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
-    for (int i = 0; i <= N_; ++i) {
-        int ref_idx   = std::min(i, static_cast<int>(x_ref.size())-1);
-        int theta_idx = std::min(i, static_cast<int>(effective_theta_ref.size())-1);
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    cloud->points.reserve(std::min(obs_x.size(), obs_y.size()));
 
-        double sx = x_ref[ref_idx];
-        double sy = y_ref[ref_idx];
-        double st = effective_theta_ref[theta_idx];
+    // Build KD cloud from static obstacles, skipping NaN/Inf
+    const size_t obs_n = std::min(obs_x.size(), obs_y.size());
+    for (size_t j = 0; j < obs_n; ++j) {
+        if (!std::isfinite(obs_x[j]) || !std::isfinite(obs_y[j])) continue;
+        cloud->points.emplace_back(static_cast<float>(obs_x[j]),
+                                   static_cast<float>(obs_y[j]),
+                                   0.0f);
+    }
 
-        double rx, ry;
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    const bool has_static_cloud = !cloud->points.empty();
+    if (has_static_cloud) {
+        kdtree.setInputCloud(cloud);
+    }
+
+    const double search_radius_sq = obs_search_radius_ * obs_search_radius_;
+
+    // Stage loop
+    double p_stage0[4] = {1000.0, 1000.0, 1000.0, 1000.0};
+    for (int i = 0; i <= N_; ++i)
+    {
+        const int ref_idx   = std::min(i, static_cast<int>(x_ref.size()) - 1);
+        const int theta_idx = std::min(i, static_cast<int>(effective_theta_ref.size()) - 1);
+
+        const double sx = x_ref[ref_idx];
+        const double sy = y_ref[ref_idx];
+        const double st = effective_theta_ref[theta_idx];
+
+    // ---------------------------------------------------------------------
+    // IMPORTANT: KD-tree query center
+    // Do NOT use ocp_nlp_out_get() to read predicted states here (pre-solve).
+    // Use (sx, sy) which is always finite if your reference is valid.
+    // Stage 0 can optionally use the true current state for slightly better locality.
+    // ---------------------------------------------------------------------
+        double rx = sx;
+        double ry = sy;
         if (i == 0) {
             rx = current_state[0];
             ry = current_state[1];
-        } else {
-            double xs[5];
-            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
-            rx = xs[0];
-            ry = xs[1];
         }
 
-        // Set stage reference
+        // Set per-stage reference for cost
         if (i < N_) {
-            double v_ref = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
+            const double v_ref = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
             double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref);
         } else {
@@ -534,14 +562,70 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        double p_data[4];
-        selectTwoObstacles(obs_x, obs_y, predicted_obstacles_,
-                           rx, ry, i, search_radius_sq, p_data);
+        double p_data[4] = { 1000.0, 1000.0, 1000.0, 1000.0 };
 
-        if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0)
-            jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+    // If query point is invalid, skip selection and keep far-away p_data
+        if (i == 0) {
+        // KD-tree radius search on static obstacles
+            std::vector<int> indices;
+            std::vector<float> sqr_dists;
+
+            int found = 0;
+            if (has_static_cloud) {
+                pcl::PointXYZ searchPoint(static_cast<float>(rx),
+                                          static_cast<float>(ry),
+                                          0.0f);
+
+                found = kdtree.radiusSearch(
+                    searchPoint,
+                    static_cast<float>(obs_search_radius_),
+                    indices,
+                    sqr_dists
+                );
+            }
+
+        // If KD finds candidates, build local obstacle vectors from KD cloud points
+            if (found > 0 && !indices.empty()) {
+                std::vector<double> local_obs_x;
+                std::vector<double> local_obs_y;
+
+                for (int idx : indices) {
+                    const auto &pt = cloud->points[static_cast<size_t>(idx)];
+                    local_obs_x.push_back((pt.x));
+                    local_obs_y.push_back((pt.y));
+                }
+
+                selectTwoObstacles(local_obs_x, local_obs_y,
+                                    predicted_obstacles_,
+                                    rx, ry, i,
+                                    search_radius_sq,
+                                    p_stage0);
+                } else {
+                    // Fallback if all KD indices got filtered out unexpectedly
+                    selectTwoObstacles(obs_x, obs_y,
+                                       predicted_obstacles_,
+                                       rx, ry, i,
+                                       search_radius_sq,
+                                       p_data);
+                }
+            } else {
+                // No KD candidates, fallback to brute-force over all obstacles
+                selectTwoObstacles(obs_x, obs_y,
+                                   predicted_obstacles_,
+                                   rx, ry, i,
+                                   search_radius_sq,
+                                   p_data);
+            }
+        }
+
+        // Update ACADOS parameters if the stage has np > 0
+        p_data[0] = p_stage0[0];
+        p_data[1] = p_stage0[1];
+        p_data[2] = p_stage0[2];
+        p_data[3] = p_stage0[3];
+        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        
     }
-
     // =========================================================================
     // 10. SOLVE
     // =========================================================================
@@ -566,6 +650,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         x_traj.push_back(xs[0]); y_traj.push_back(xs[1]);
     }
     publishTrajectory(x_traj, y_traj);
+    const double ms = (ros::WallTime::now() - t0).toSec() * 1e3;
+    ROS_INFO_STREAM_THROTTLE(1.0, 
+        "[BENCH] solveOCP wall-time = " << ms << " ms");
     return true;
 }
 
@@ -654,10 +741,7 @@ void MPCNode::run() {
 
         std::vector<double> all_obs_x, all_obs_y;
         all_obs_x.insert(all_obs_x.end(), obs_x_.begin(), obs_x_.end());
-        all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
-        all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
-
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
         if (success) {
