@@ -87,7 +87,7 @@ public:
         double x_map_to_chassis = tx - map_origin[0];
         double y_map_to_chassis = ty - map_origin[1];
 
-ut i        double half = BOX_HALFLENGTH / 2.0;
+        double half = BOX_HALFLENGTH / 2.0;
         double tl_x = x_map_to_chassis - half,  tl_y = y_map_to_chassis - half;
         double br_x = x_map_to_chassis + half,  br_y = y_map_to_chassis + half;
 
