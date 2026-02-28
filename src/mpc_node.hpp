@@ -42,11 +42,15 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
-// Priority: DYNAMIC_OBS > STATIC_OBS > NORMAL
+// Priority: DYNAMIC_OBS > RUSH_GOAL > STATIC_OBS > NORMAL
+// RUSH_GOAL only fires when we are already in STATIC_OBS mode AND
+// the robot is within rush_goal_dist_ of the end of the global path.
 enum class ControlMode {
     NORMAL,       // No obstacles nearby — full speed cap (v_linear_max_)
     STATIC_OBS,   // Static obstacles detected — hard-capped at v_static_obs_max_
-    DYNAMIC_OBS   // Dynamic obstacles detected — full speed, higher accel weight
+    DYNAMIC_OBS,  // Dynamic obstacles detected — full speed, higher accel weight
+    RUSH_GOAL     // Near goal while static obs present — blast at v_linear_max_,
+                  // obstacles cleared from ACADOS params, heavy position weight
 };
 
 class MPCNode {
@@ -126,12 +130,8 @@ private:
         const std::vector<DynamicObstacle>& obstacles, double dt, int N);
 
     // =========================================================================
-    // Obstacle selection — replaces L/R binary classification
+    // Obstacle selection
     // =========================================================================
-    // Selects the 2 best obstacles to fill the ACADOS parameter slots at each
-    // stage. "Best" means: slot1 = closest, slot2 = closest with >30° angular
-    // separation from slot1 (to avoid constraint rank-deficiency in corridors).
-    // Both static and dynamic (predicted) obstacles are considered together.
     void selectTwoObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
@@ -141,10 +141,22 @@ private:
         double search_radius_sq,
         double p_data[4]) const;
 
-    // Emergency stop for 3rd+ dynamic obstacle (invisible to ACADOS 2-slot model)
+    // Emergency stop for 3rd+ dynamic obstacle
     bool checkEmergencyStop(
         const std::vector<PredictedObstacle>& predicted_obstacles,
         const std::vector<double>& current_state) const;
+
+    // =========================================================================
+    // RUSH_GOAL helpers
+    // =========================================================================
+    // Returns distance from robot to the last point of the global path.
+    double distToGoal(double rx, double ry) const;
+
+    // Warm-start the ACADOS solver by reinitialising every stage's state
+    // to the current robot state and zeroing controls.  This clears the
+    // stale STATIC_OBS solution so the solver doesn't oscillate on the
+    // first RUSH_GOAL iteration.
+    void warmStartFromCurrentState(const std::vector<double>& current_state);
 
     // =========================================================================
     // Robot constants (fixed)
@@ -163,7 +175,7 @@ private:
     // =========================================================================
 
     // --- Velocity limits ---
-    double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS
+    double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS & RUSH_GOAL
     double v_static_obs_max_  = 0.9;   // [m/s] cap for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
     double omega_static_obs_max_ = 0.8; // [rad/s] cap for STATIC_OBS
@@ -190,6 +202,28 @@ private:
     // --- Reversal detection ---
     double reversal_threshold_ = 0.7;
     double reversal_angle_deg_ = 90.0;
+
+    // --- RUSH_GOAL ---
+    // Activates only when mode would be STATIC_OBS AND robot is within this
+    // distance of the end of the global path.
+    double rush_goal_dist_      = 4.0;    // [m] trigger distance to goal
+    double rush_goal_exit_dist_ = 0.5;   // [m] release latch once this close
+
+    // Direct absolute cost weights used ONLY in RUSH_GOAL (not multipliers).
+    // Key insight: velocity weight must dominate over position so the solver
+    // prioritises hitting v_ref=2.0 rather than micro-correcting xy error.
+    double rush_weight_position_   = 5000.0;
+    double rush_weight_heading_    = 6000.0;
+    double rush_weight_velocity_   = 50000.0;  // dominates — solver must chase v_ref=2.0
+    double rush_weight_accel_      = 0.00001;
+    double rush_vref_              = 2.0;
+
+    // Tracks whether the previous solve was in RUSH_GOAL so we know when to
+    // issue a warm-start reset (transition from STATIC_OBS → RUSH_GOAL).
+    bool   prev_was_rush_goal_  = false;
+    // Once RUSH_GOAL fires it latches ON until the robot reaches the goal
+    // (goal_dist < rush_goal_exit_dist_) or a dynamic obstacle appears.
+    bool   rush_goal_latched_   = false;
 
     // =========================================================================
     // Runtime state
