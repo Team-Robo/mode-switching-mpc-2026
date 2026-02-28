@@ -529,7 +529,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     const double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
     // Stage loop
-    double p_stage0[4] = {1000.0, 1000.0, 1000.0, 1000.0};
     for (int i = 0; i <= N_; ++i)
     {
         const int ref_idx   = std::min(i, static_cast<int>(x_ref.size()) - 1);
@@ -539,22 +538,12 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         const double sy = y_ref[ref_idx];
         const double st = effective_theta_ref[theta_idx];
 
-    // ---------------------------------------------------------------------
-    // IMPORTANT: KD-tree query center
-    // Do NOT use ocp_nlp_out_get() to read predicted states here (pre-solve).
-    // Use (sx, sy) which is always finite if your reference is valid.
-    // Stage 0 can optionally use the true current state for slightly better locality.
-    // ---------------------------------------------------------------------
-        double rx = sx;
-        double ry = sy;
-        if (i == 0) {
-            rx = current_state[0];
-            ry = current_state[1];
-        }
-
-        // Set per-stage reference for cost
+        double rx = current_state[0];
+        double ry = current_state[1];
+        // ---- cost reference ----
         if (i < N_) {
-            const double v_ref = (mode_ == ControlMode::STATIC_OBS) ? v_static_obs_max_ : v_linear_max_;
+            const double v_ref = (mode_ == ControlMode::STATIC_OBS) ?
+                                 v_static_obs_max_ : v_linear_max_;
             double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref);
         } else {
@@ -562,69 +551,41 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        double p_data[4] = { 1000.0, 1000.0, 1000.0, 1000.0 };
+        double p_data[4] = {1000.0, 1000.0, 1000.0, 1000.0};
 
-    // If query point is invalid, skip selection and keep far-away p_data
-        if (i == 0) {
-        // KD-tree radius search on static obstacles
+        std::vector<double> local_obs_x;
+        std::vector<double> local_obs_y;
+
+        if (has_static_cloud) {
+
+            pcl::PointXYZ searchPoint(rx, ry, 0.0f);
+
             std::vector<int> indices;
             std::vector<float> sqr_dists;
 
-            int found = 0;
-            if (has_static_cloud) {
-                pcl::PointXYZ searchPoint(static_cast<float>(rx),
-                                          static_cast<float>(ry),
-                                          0.0f);
+            int found = kdtree.radiusSearch(
+                searchPoint,
+                obs_search_radius_,
+                indices,
+                sqr_dists
+            );
 
-                found = kdtree.radiusSearch(
-                    searchPoint,
-                    static_cast<float>(obs_search_radius_),
-                    indices,
-                    sqr_dists
-                );
-            }
-
-        // If KD finds candidates, build local obstacle vectors from KD cloud points
-            if (found > 0 && !indices.empty()) {
-                std::vector<double> local_obs_x;
-                std::vector<double> local_obs_y;
-
-                for (int idx : indices) {
-                    const auto &pt = cloud->points[static_cast<size_t>(idx)];
-                    local_obs_x.push_back((pt.x));
-                    local_obs_y.push_back((pt.y));
-                }
-
-                selectTwoObstacles(local_obs_x, local_obs_y,
-                                    predicted_obstacles_,
-                                    rx, ry, i,
-                                    search_radius_sq,
-                                    p_stage0);
-                } else {
-                    // Fallback if all KD indices got filtered out unexpectedly
-                    selectTwoObstacles(obs_x, obs_y,
-                                       predicted_obstacles_,
-                                       rx, ry, i,
-                                       search_radius_sq,
-                                       p_data);
-                }
-            } else {
-                // No KD candidates, fallback to brute-force over all obstacles
-                selectTwoObstacles(obs_x, obs_y,
-                                   predicted_obstacles_,
-                                   rx, ry, i,
-                                   search_radius_sq,
-                                   p_data);
+            for (int idx : indices) {
+                const auto &pt = cloud->points[idx];
+                local_obs_x.push_back(pt.x);
+                local_obs_y.push_back(pt.y);
             }
         }
-
-        // Update ACADOS parameters if the stage has np > 0
-        p_data[0] = p_stage0[0];
-        p_data[1] = p_stage0[1];
-        p_data[2] = p_stage0[2];
-        p_data[3] = p_stage0[3];
+        selectTwoObstacles(
+            local_obs_x,
+            local_obs_y,
+            predicted_obstacles_,
+            rx, ry,
+            i,
+            search_radius_sq,
+            p_data
+        );
         jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
-        
     }
     // =========================================================================
     // 10. SOLVE
