@@ -3,6 +3,9 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 #include <algorithm>
 #include <limits>
+#include <pcl/point_types.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/point_cloud.h>
 
 // mpc_node.cpp
 
@@ -30,7 +33,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
     nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
     nh_private_.param<double>("safety_margin",      safety_margin_,      0.01);
-    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  4.0);
+    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  1.5);
 
     nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
     nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
@@ -257,54 +260,34 @@ double MPCNode::distToGoal(double rx, double ry) const {
     return std::sqrt(dx*dx + dy*dy);
 }
 
-// Warm-start for RUSH_GOAL: seed every stage with a full-speed trajectory.
-// Problem with the old approach (all stages = current_state at v~0.5):
-//   SQP-RTI runs only 1 QP iteration per cycle, so it can only take a small
-//   step away from the initial guess each solve. Starting at v=0.5 everywhere
-//   means it takes ~10-15 cycles (~0.4-0.6 s) to climb to 2.0 m/s — which is
-//   most of the 4 m RUSH_GOAL window, so the robot never actually rushes.
-//
-// Fix: build a kinematically consistent initial trajectory by propagating
-//   forward from the current pose at vr=vl=rush_vref_ (both wheels at max).
-//   This gives the QP a warm-start that is already AT full speed, so the first
-//   iteration produces a near-2.0 m/s command immediately.
 void MPCNode::warmStartFromCurrentState(const std::vector<double>& current_state) {
     constexpr double Tf = 2.0;
     double dt = Tf / N_;
 
-    // Build full-speed initial state trajectory: propagate differential drive
-    // dynamics at vr=vl=rush_vref_ (straight line at full speed, zero omega).
     double vr_full = rush_vref_;
     double vl_full = rush_vref_;
-    double v_full  = (vr_full + vl_full) / 2.0;  // = rush_vref_
-    // omega = (vr-vl)/L = 0  →  robot drives straight along current heading
+    double v_full  = (vr_full + vl_full) / 2.0;
 
     double x_k   = current_state[0];
     double y_k   = current_state[1];
     double th_k  = current_state[2];
 
-    // u = max acceleration to reach rush_vref_ from current velocity in 1 step
-    double v_now = (current_state[3] + current_state[4]) / 2.0;
-    double ar = (rush_vref_ - current_state[3]) / dt;  // right wheel accel
-    double al = (rush_vref_ - current_state[4]) / dt;  // left  wheel accel
-    // Clamp to actuator limits (3.0 m/s² for physical, simulation go high)
+    double ar = (rush_vref_ - current_state[3]) / dt;
+    double al = (rush_vref_ - current_state[4]) / dt;
     ar = std::max(-4.0, std::min(4.0, ar));
     al = std::max(-4.0, std::min(4.0, al));
     double u_full[2] = {ar, al};
 
     for (int i = 0; i <= N_; ++i) {
         double stage_state[5] = {x_k, y_k, th_k, vr_full, vl_full};
-        // Stage 0: keep actual current state to satisfy initial constraint
         if (i == 0) {
             ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, 0, "x",
                             const_cast<double*>(current_state.data()));
         } else {
             ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "x", stage_state);
         }
-        // Propagate straight-line kinematics for next stage
         x_k  += v_full * std::cos(th_k) * dt;
         y_k  += v_full * std::sin(th_k) * dt;
-        // th_k stays constant (omega=0)
     }
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "u", u_full);
@@ -430,8 +413,11 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& theta_ref,
                        const std::vector<double>& current_state,
                        const std::vector<double>& obs_x,
-                       const std::vector<double>& obs_y)
+                       const std::vector<double>& obs_y
+                    )
 {
+    auto t0 = ros::WallTime::now();
+
     // =========================================================================
     // 1. INITIAL STATE CONSTRAINT
     // =========================================================================
@@ -456,10 +442,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     // =========================================================================
     // 4. MODE DETECTION
-    //    Priority: DYNAMIC_OBS > RUSH_GOAL > STATIC_OBS > NORMAL
-    //    RUSH_GOAL only fires when STATIC_OBS would be active (static obstacles
-    //    nearby) AND the robot is within rush_goal_dist_ of the path end.
-    //    Dynamic obstacles suppress RUSH_GOAL entirely for safety.
     // =========================================================================
     bool has_dynamic_obs = false;
     double closest_dynamic_dist = std::numeric_limits<double>::max();
@@ -486,13 +468,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     bool near_goal   = (goal_dist < rush_goal_dist_);
 
     // --- RUSH_GOAL latch management ---
-    // Trigger conditions (either is sufficient — both mean "commit to the goal"):
-    //   A) Static obstacle nearby AND near goal  → was navigating through obstacles, now close
-    //   B) No static obs, no dynamic obs, near goal → path is clear, still close to goal
-    //      (covers the STATIC→NORMAL→goal case where the last obstacle was passed)
-    // Unlatch only when:
-    //   (a) a dynamic obstacle appears (safety), or
-    //   (b) the goal is essentially reached (rush_goal_exit_dist_).
     const bool trigger_rush = near_goal && !has_dynamic_obs;
 
     if (has_dynamic_obs) {
@@ -525,10 +500,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     // =========================================================================
     // 5. RUSH_GOAL WARM-START
-    //    On the first iteration transitioning into RUSH_GOAL we flush the warm
-    //    start so the SQP-RTI does not inherit the slow, curved STATIC_OBS
-    //    trajectory.  Without this the solver sometimes oscillates for 3-5
-    //    cycles while it unwinds the old solution.
     // =========================================================================
     if (mode_ == ControlMode::RUSH_GOAL && !prev_was_rush_goal_) {
         ROS_INFO("RUSH_GOAL: warm-starting solver from current state");
@@ -544,9 +515,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     switch (mode_) {
         case ControlMode::RUSH_GOAL:
-            // Full speed. Obstacles cleared from params (step 10).
-            // Direct absolute weights — velocity weight dominates so the solver
-            // prioritises hitting rush_vref_ (2.0 m/s) over xy micro-correction.
             v_cap                  = v_linear_max_;
             omega_cap              = omega_max_;
             eff_pos_weight         = rush_weight_position_;
@@ -597,16 +565,11 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     // =========================================================================
     // 8. CONSTRAINT BOUNDS
-    //    In RUSH_GOAL we use the full NORMAL velocity envelope so the solver is
-    //    not velocity-capped.  Obstacle distance constraints are effectively
-    //    deactivated by parking the obstacle parameters far away (step 9),
-    //    but we still keep the h-constraint structure valid.
     // =========================================================================
     double min_dist_sq;
     if (mode_ == ControlMode::DYNAMIC_OBS) {
         min_dist_sq = std::pow(robot_radius_ + dynamic_obs_radius_ + safety_margin_, 2.0);
     } else {
-        // NORMAL, STATIC_OBS, RUSH_GOAL — robot footprint only
         min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
     }
     double lh[4] = { -v_cap, -omega_cap, min_dist_sq, min_dist_sq };
@@ -618,11 +581,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
-    // 9. COST WEIGHTS — ny = 6: [x, y, theta, v_linear, ar, al]
-    //    Terminal cost W_e covers [x, y, theta] only (ny_e = 3).
-    //    In RUSH_GOAL: boost terminal velocity cost by adding it to stage costs
-    //    with a very high weight so SQP-RTI is strongly pulled toward rush_vref_.
-    //    No hard velocity floor (causes infeasibility near obstacles).
+    // 9. COST WEIGHTS
     // =========================================================================
     int ny = 4 + nu_;  // 6
     std::vector<double> W(ny * ny, 0.0);
@@ -637,8 +596,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
 
     // Terminal cost W_e: [x, y, theta] — ny_e = 3
-    // In RUSH_GOAL crank up position weight at terminal stage so the solver
-    // commits to reaching the goal position (velocity is already handled per-stage).
     {
         int ny_e = 3;
         std::vector<double> W_e(ny_e * ny_e, 0.0);
@@ -656,39 +613,38 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     // =========================================================================
     // 10. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
+    //     Build KD-tree ONCE outside the loop, then query per stage.
     // =========================================================================
-    double search_radius_sq = obs_search_radius_ * obs_search_radius_;
-
-    // In RUSH_GOAL we clear all obstacle slots to avoid the obstacle repulsion
-    // costs fighting the high-speed goal rush.  The robot's own collision
-    // geometry (robot_radius_ + safety_margin_) still enforces the hard lower
-    // bound on the distance constraint, so this is NOT safety-critical — it
-    // merely removes the gradient pulling the solver away from the goal path.
     const bool clear_obstacles = (mode_ == ControlMode::RUSH_GOAL);
 
+    // Build static obstacle point cloud and KD-tree once before the stage loop
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    const size_t obs_n = std::min(obs_x.size(), obs_y.size());
+    for (size_t j = 0; j < obs_n; ++j) {
+        if (!std::isfinite(obs_x[j]) || !std::isfinite(obs_y[j])) continue;
+        cloud->points.emplace_back(static_cast<float>(obs_x[j]),
+                                   static_cast<float>(obs_y[j]),
+                                   0.0f);
+    }
+
+    pcl::KdTreeFLANN<pcl::PointXYZ> kdtree;
+    const bool has_static_cloud = !cloud->points.empty();
+    if (has_static_cloud) {
+        kdtree.setInputCloud(cloud);
+    }
+
+    const double search_radius_sq = obs_search_radius_ * obs_search_radius_;
+
     for (int i = 0; i <= N_; ++i) {
-        int ref_idx   = std::min(i, static_cast<int>(x_ref.size())-1);
-        int theta_idx = std::min(i, static_cast<int>(effective_theta_ref.size())-1);
+        const int ref_idx   = std::min(i, static_cast<int>(x_ref.size()) - 1);
+        const int theta_idx = std::min(i, static_cast<int>(effective_theta_ref.size()) - 1);
 
-        double sx = x_ref[ref_idx];
-        double sy = y_ref[ref_idx];
-        double st = effective_theta_ref[theta_idx];
+        const double sx = x_ref[ref_idx];
+        const double sy = y_ref[ref_idx];
+        const double st = effective_theta_ref[theta_idx];
 
-        double rx, ry;
-        if (i == 0) {
-            rx = current_state[0];
-            ry = current_state[1];
-        } else {
-            double xs[5];
-            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
-            rx = xs[0];
-            ry = xs[1];
-        }
-
-        // Set stage reference
+        // ---- cost reference ----
         if (i < N_) {
-            // v_ref: RUSH_GOAL uses rush_vref_ (explicit 2.0 m/s target).
-            // STATIC_OBS uses v_static_obs_max_. All others use v_linear_max_.
             double v_ref;
             if (mode_ == ControlMode::RUSH_GOAL)       v_ref = rush_vref_;
             else if (mode_ == ControlMode::STATIC_OBS) v_ref = v_static_obs_max_;
@@ -700,20 +656,36 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        // Obstacle parameters
+        // ---- obstacle parameters ----
         double p_data[4];
         if (clear_obstacles) {
-            // Park both obstacle slots far away — constraints are structurally
-            // present but produce near-zero gradient (obstacle is 1000 m away).
             p_data[0] = 1000.0; p_data[1] = 1000.0;
             p_data[2] = 1000.0; p_data[3] = 1000.0;
         } else {
-            selectTwoObstacles(obs_x, obs_y, predicted_obstacles_,
-                               rx, ry, i, search_radius_sq, p_data);
+            // Query KD-tree for static obstacles near the robot's current position
+            std::vector<double> local_obs_x;
+            std::vector<double> local_obs_y;
+
+            if (has_static_cloud) {
+                pcl::PointXYZ searchPoint(
+                    static_cast<float>(current_state[0]),
+                    static_cast<float>(current_state[1]),
+                    0.0f);
+                std::vector<int> indices;
+                std::vector<float> sqr_dists;
+                kdtree.radiusSearch(searchPoint, obs_search_radius_, indices, sqr_dists);
+                for (int idx : indices) {
+                    local_obs_x.push_back(cloud->points[idx].x);
+                    local_obs_y.push_back(cloud->points[idx].y);
+                }
+            }
+
+            selectTwoObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
+                               current_state[0], current_state[1],
+                               i, search_radius_sq, p_data);
         }
 
-        if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0)
-            jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
     }
 
     // =========================================================================
@@ -740,6 +712,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         x_traj.push_back(xs[0]); y_traj.push_back(xs[1]);
     }
     publishTrajectory(x_traj, y_traj);
+    const double ms = (ros::WallTime::now() - t0).toSec() * 1e3;
+    ROS_INFO_STREAM_THROTTLE(1.0,
+        "[BENCH] solveOCP wall-time = " << ms << " ms");
     return true;
 }
 
@@ -785,7 +760,7 @@ void MPCNode::publishMarker() {
         case ControlMode::NORMAL:      m.color.r=0.0; m.color.g=1.0; m.color.b=0.0; break;
         case ControlMode::STATIC_OBS:  m.color.r=1.0; m.color.g=0.5; m.color.b=0.0; break;
         case ControlMode::DYNAMIC_OBS: m.color.r=1.0; m.color.g=0.0; m.color.b=0.0; break;
-        case ControlMode::RUSH_GOAL:   m.color.r=0.5; m.color.g=0.0; m.color.b=1.0; break;  // purple
+        case ControlMode::RUSH_GOAL:   m.color.r=0.5; m.color.g=0.0; m.color.b=1.0; break;
     }
     pub_marker_.publish(m);
     m.id = 1;
@@ -829,10 +804,7 @@ void MPCNode::run() {
 
         std::vector<double> all_obs_x, all_obs_y;
         all_obs_x.insert(all_obs_x.end(), obs_x_.begin(), obs_x_.end());
-        all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
-        all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
-
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
         if (success) {
