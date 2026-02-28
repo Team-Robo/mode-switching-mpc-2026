@@ -17,6 +17,9 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <pcl/point_types.h>
+#include <pcl/kdtree/kdtree_flann.h>
+#include <pcl/point_cloud.h>
 
 // ACADOS interface
 extern "C" {
@@ -236,6 +239,15 @@ private:
     std::vector<DynamicObstacle> dynamic_obstacles_;
     std::vector<double> obs_x_, obs_y_;
     std::vector<double> map_x_, map_y_;
+
+    // Cached KD-tree for static obstacles (rebuilt on each cloud callback)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr static_obs_cloud_;
+    pcl::KdTreeFLANN<pcl::PointXYZ>    static_obs_kdtree_;
+    bool                                static_obs_kdtree_valid_ = false;
+    void rebuildStaticKdtree();
+
+    ros::Time last_dynamic_obs_time_;
+    double dynamic_obs_timeout_ = 0.5;
 
     ControlMode mode_        = ControlMode::NORMAL;
     bool        in_reversal_ = false;

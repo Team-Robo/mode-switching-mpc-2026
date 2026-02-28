@@ -28,12 +28,12 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("accel_weight_mult_dynamic",  accel_weight_mult_dynamic_, 5.5);
 
     nh_private_.param<double>("static_obs_safe_dist",  static_obs_safe_dist_,  1.1);
-    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 3.0);
+    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 4.0);
 
     nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
     nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
     nh_private_.param<double>("safety_margin",      safety_margin_,      0.01);
-    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  1.5);
+    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  4.0);
 
     nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
     nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
@@ -46,6 +46,9 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("rush_weight_velocity", rush_weight_velocity_, 3050.0);
     nh_private_.param<double>("rush_weight_accel",    rush_weight_accel_,    0.0);
     nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
+
+    // Dynamic obstacle hysteresis timeout
+    nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.5);
 
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
@@ -61,6 +64,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("  RUSH_GOAL: dist=%.1f m  pos=%.0f  hdg=%.0f  vel=%.0f  accel=%.5f  vref=%.1f",
              rush_goal_dist_, rush_weight_position_, rush_weight_heading_,
              rush_weight_velocity_, rush_weight_accel_, rush_vref_);
+    ROS_INFO("  Dynamic obs hysteresis timeout: %.2f s", dynamic_obs_timeout_);
 
     pub_vel_      = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
@@ -75,6 +79,10 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
                                           &MPCNode::callbackTrackDynamicObstacle, this);
 
     current_state_.resize(nx_, 0.0);
+
+    // Initialise hysteresis timestamp to a time far in the past
+    last_dynamic_obs_time_ = ros::Time(0);
+
     initializeAcadosSolver();
 
     ROS_INFO("MPC Node initialized with ACADOS solver");
@@ -454,6 +462,20 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         if (dist < dynamic_obs_safe_dist_) has_dynamic_obs = true;
     }
 
+    // --- Dynamic obstacle hysteresis latch ---
+    // Keeps DYNAMIC_OBS active for dynamic_obs_timeout_ seconds after the tracker
+    // loses the obstacle (common at close range due to occlusion / tracker dropout).
+    // Without this, the robot can fall through to STATIC_OBS while the dynamic
+    // obstacle's lidar returns are still present in the point cloud, causing the
+    // solver to receive tighter velocity bounds mid-manoeuvre and fail.
+    ros::Time now = ros::Time::now();
+    if (has_dynamic_obs) {
+        last_dynamic_obs_time_ = now;
+    }
+    const bool dynamic_obs_active =
+        has_dynamic_obs ||
+        ((now - last_dynamic_obs_time_).toSec() < dynamic_obs_timeout_);
+
     bool has_static_obs = false;
     double closest_static_dist = std::numeric_limits<double>::max();
     for (size_t i = 0; i < obs_x.size(); ++i) {
@@ -468,9 +490,18 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     bool near_goal   = (goal_dist < rush_goal_dist_);
 
     // --- RUSH_GOAL latch management ---
-    const bool trigger_rush = near_goal && !has_dynamic_obs;
+    // Only allow rush if robot is roughly facing the goal
+    bool facing_goal = false;
+    if (!og_x_ref_.empty()) {
+        double dx_goal = og_x_ref_.back() - current_state[0];
+        double dy_goal = og_y_ref_.back() - current_state[1];
+        double angle_to_goal = std::atan2(dy_goal, dx_goal);
+        double heading_err = diffAngle(current_state[2], angle_to_goal);
+        facing_goal = (heading_err < (45.0 * M_PI / 180.0));
+    }
+    const bool trigger_rush = near_goal && !dynamic_obs_active && !has_static_obs && facing_goal;
 
-    if (has_dynamic_obs) {
+    if (dynamic_obs_active) {
         rush_goal_latched_ = false;
     } else if (trigger_rush) {
         rush_goal_latched_ = true;
@@ -479,10 +510,15 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_INFO("RUSH_GOAL: goal reached, releasing latch (dist=%.2fm)", goal_dist);
     }
 
-    if (has_dynamic_obs) {
+    if (dynamic_obs_active) {
         mode_ = ControlMode::DYNAMIC_OBS;
         display_text_ = "DYNAMIC_OBS";
-        ROS_INFO_THROTTLE(1.0, "Mode: DYNAMIC_OBS (closest=%.2fm)", closest_dynamic_dist);
+        if (has_dynamic_obs) {
+            ROS_INFO_THROTTLE(1.0, "Mode: DYNAMIC_OBS (closest=%.2fm)", closest_dynamic_dist);
+        } else {
+            ROS_INFO_THROTTLE(1.0, "Mode: DYNAMIC_OBS [hysteresis, last seen %.2fs ago]",
+                              (now - last_dynamic_obs_time_).toSec());
+        }
     } else if (rush_goal_latched_) {
         mode_ = ControlMode::RUSH_GOAL;
         display_text_ = "RUSH_GOAL";
@@ -662,14 +698,23 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             p_data[0] = 1000.0; p_data[1] = 1000.0;
             p_data[2] = 1000.0; p_data[3] = 1000.0;
         } else {
-            // Query KD-tree for static obstacles near the robot's current position
-            std::vector<double> local_obs_x;
-            std::vector<double> local_obs_y;
+            double pred_x, pred_y;
+            if (i == 0) {
+                pred_x = current_state[0];
+                pred_y = current_state[1];
+            } else {
+                // Grab predicted state from warm solution (previous solve)
+                double xs[5];
+                ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
+                pred_x = xs[0];
+                pred_y = xs[1];
+            }
 
-            if (has_static_cloud) {
+            std::vector<double> local_obs_x, local_obs_y;
+            if (has_static_cloud && !clear_obstacles) {
                 pcl::PointXYZ searchPoint(
-                    static_cast<float>(current_state[0]),
-                    static_cast<float>(current_state[1]),
+                    static_cast<float>(pred_x),
+                    static_cast<float>(pred_y),
                     0.0f);
                 std::vector<int> indices;
                 std::vector<float> sqr_dists;
@@ -679,10 +724,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                     local_obs_y.push_back(cloud->points[idx].y);
                 }
             }
-
             selectTwoObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
-                               current_state[0], current_state[1],
-                               i, search_radius_sq, p_data);
+                            pred_x, pred_y,
+                            i, search_radius_sq, p_data);
         }
 
         jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
@@ -804,7 +848,9 @@ void MPCNode::run() {
 
         std::vector<double> all_obs_x, all_obs_y;
         all_obs_x.insert(all_obs_x.end(), obs_x_.begin(), obs_x_.end());
+        all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
+        all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
         if (success) {
