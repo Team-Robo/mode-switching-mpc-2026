@@ -4,40 +4,76 @@
 #include <algorithm>
 #include <limits>
 
+// mpc_node.cpp
+
 namespace mpc_controller {
 
 MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
-    : nh_(nh), nh_private_(nh_private) {
-    
-    // Load parameters from parameter server
-    nh_private_.param<double>("v_linear_max", v_linear_max_, 2.0);  // max linear velocity [m/s]
-    nh_private_.param<double>("reversa_alpha", reversa_alpha, 0.55);
-    nh_private_.param<double>("obs_search_radius", obs_search_radius_, 4.0);
-    nh_private_.param<double>("min_obstacle_distance", min_obstacle_distance_, 0.35);
-    nh_private_.param<double>("SAFE_DISTANCE", SAFE_DISTANCE, 1.75);  // INCREASED DEFAULT
-    
-    ROS_INFO("MPC Parameters: N=%d, v_linear_max=%.2f m/s, SAFE_DISTANCE=%.2f m",
-             N_, v_linear_max_, SAFE_DISTANCE);
-    
-    // Initialize publishers
-    pub_vel_ = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
-    pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
-    pub_marker_ = nh_.advertise<visualization_msgs::Marker>("/mode", 1);
-    
-    // Initialize subscribers
-    sub_odom_ = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
-    sub_global_plan_ = nh_.subscribe("/move_base/TrajectoryPlannerROS/global_plan", 1, 
-                                     &MPCNode::callbackGlobalPlan, this);
+    : nh_(nh), nh_private_(nh_private)
+{
+    nh_private_.param<double>("v_linear_max",      v_linear_max_,      2.0);
+    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  0.5);
+    nh_private_.param<double>("omega_max",          omega_max_,         1.8);
+    nh_private_.param<double>("omega_static_obs_max", omega_static_obs_max_, 0.8);
 
-    sub_cloud_ = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
-    sub_map_cloud_ = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
-    
-    // Initialize state
+    nh_private_.param<double>("weight_position_error",  weight_position_error_,  130.0);
+    nh_private_.param<double>("weight_heading_error",   weight_heading_error_,   49.0);
+    nh_private_.param<double>("weight_velocity",        weight_velocity_,        27.0);
+    nh_private_.param<double>("weight_acceleration",    weight_acceleration_,    0.0011130334330777412);
+
+    nh_private_.param<double>("accel_weight_mult_static",   accel_weight_mult_static_,  3.0);
+    nh_private_.param<double>("accel_weight_mult_dynamic",  accel_weight_mult_dynamic_, 5.5);
+
+    nh_private_.param<double>("static_obs_safe_dist",  static_obs_safe_dist_,  1.1);
+    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 3.0);
+
+    nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
+    nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
+    nh_private_.param<double>("safety_margin",      safety_margin_,      0.01);
+    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  4.0);
+
+    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
+    nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
+
+    // RUSH_GOAL params — direct absolute weights, no multipliers
+    nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.0);
+    nh_private_.param<double>("rush_goal_exit_dist",  rush_goal_exit_dist_,  0.0);
+    nh_private_.param<double>("rush_weight_position", rush_weight_position_, 0.0);
+    nh_private_.param<double>("rush_weight_heading",  rush_weight_heading_,  3030.0);
+    nh_private_.param<double>("rush_weight_velocity", rush_weight_velocity_, 3050.0);
+    nh_private_.param<double>("rush_weight_accel",    rush_weight_accel_,    0.0);
+    nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
+
+    ROS_INFO("=== MPC Node Parameters ===");
+    ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
+             v_linear_max_, v_static_obs_max_, omega_max_);
+    ROS_INFO("  Weights: pos=%.2f  heading=%.2f  accel=%.4f  velocity=%.2f",
+             weight_position_error_, weight_heading_error_, weight_acceleration_, weight_velocity_);
+    ROS_INFO("  Accel mults: static=%.1f  dynamic=%.1f",
+             accel_weight_mult_static_, accel_weight_mult_dynamic_);
+    ROS_INFO("  Trigger dists: static=%.2f m  dynamic=%.2f m",
+             static_obs_safe_dist_, dynamic_obs_safe_dist_);
+    ROS_INFO("  Reversal: threshold=%.2f  angle=%.1f deg",
+             reversal_threshold_, reversal_angle_deg_);
+    ROS_INFO("  RUSH_GOAL: dist=%.1f m  pos=%.0f  hdg=%.0f  vel=%.0f  accel=%.5f  vref=%.1f",
+             rush_goal_dist_, rush_weight_position_, rush_weight_heading_,
+             rush_weight_velocity_, rush_weight_accel_, rush_vref_);
+
+    pub_vel_      = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
+    pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
+    pub_marker_   = nh_.advertise<visualization_msgs::Marker>("/mode", 1);
+
+    sub_odom_       = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
+    sub_global_plan_= nh_.subscribe("/move_base/TrajectoryPlannerROS/global_plan", 1,
+                                    &MPCNode::callbackGlobalPlan, this);
+    sub_cloud_      = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
+    sub_map_cloud_  = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
+    sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10,
+                                          &MPCNode::callbackTrackDynamicObstacle, this);
+
     current_state_.resize(nx_, 0.0);
-    
-    // Initialize ACADOS solver
     initializeAcadosSolver();
-    
+
     ROS_INFO("MPC Node initialized with ACADOS solver");
 }
 
@@ -46,640 +82,792 @@ MPCNode::~MPCNode() {
 }
 
 void MPCNode::initializeAcadosSolver() {
-    // Create ACADOS solver capsule
     acados_ocp_capsule_ = jackal_diff_drive_acados_create_capsule();
-    
-    // Create the solver
     int status = jackal_diff_drive_acados_create(acados_ocp_capsule_);
-    if (status != 0) {
-        ROS_ERROR("Failed to create ACADOS solver");
-        return;
-    }
-    
-    // Get pointers to solver components
+    if (status != 0) { ROS_ERROR("Failed to create ACADOS solver"); return; }
     nlp_config_ = jackal_diff_drive_acados_get_nlp_config(acados_ocp_capsule_);
-    nlp_dims_ = jackal_diff_drive_acados_get_nlp_dims(acados_ocp_capsule_);
-    nlp_in_ = jackal_diff_drive_acados_get_nlp_in(acados_ocp_capsule_);
-    nlp_out_ = jackal_diff_drive_acados_get_nlp_out(acados_ocp_capsule_);
+    nlp_dims_   = jackal_diff_drive_acados_get_nlp_dims(acados_ocp_capsule_);
+    nlp_in_     = jackal_diff_drive_acados_get_nlp_in(acados_ocp_capsule_);
+    nlp_out_    = jackal_diff_drive_acados_get_nlp_out(acados_ocp_capsule_);
     nlp_solver_ = jackal_diff_drive_acados_get_nlp_solver(acados_ocp_capsule_);
-    nlp_opts_ = jackal_diff_drive_acados_get_nlp_opts(acados_ocp_capsule_);
-    
+    nlp_opts_   = jackal_diff_drive_acados_get_nlp_opts(acados_ocp_capsule_);
     ROS_INFO("ACADOS solver created successfully");
 }
 
 void MPCNode::cleanupAcadosSolver() {
     if (acados_ocp_capsule_ != nullptr) {
-        int status = jackal_diff_drive_acados_free(acados_ocp_capsule_);
-        if (status != 0) {
+        if (jackal_diff_drive_acados_free(acados_ocp_capsule_) != 0)
             ROS_WARN("Failed to free ACADOS solver");
-        }
-        status = jackal_diff_drive_acados_free_capsule(acados_ocp_capsule_);
-        if (status != 0) {
+        if (jackal_diff_drive_acados_free_capsule(acados_ocp_capsule_) != 0)
             ROS_WARN("Failed to free ACADOS capsule");
-        }
     }
 }
 
+// =============================================================================
+// Callbacks
+// =============================================================================
 void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     double yaw = quaternionToYaw(msg->pose.pose.orientation);
-    double x = msg->pose.pose.position.x;
-    double y = msg->pose.pose.position.y;
-    double v = msg->twist.twist.linear.x;
-    double w = msg->twist.twist.angular.z;
-    
-    // Convert to wheel velocities
-    double vr = v + w * WHEELBASE / 2.0;
-    double vl = v - w * WHEELBASE / 2.0;
-    
-    // Update current state [x, y, theta, vr, vl]
-    current_state_[0] = x;
-    current_state_[1] = y;
+    double v   = msg->twist.twist.linear.x;
+    double w   = msg->twist.twist.angular.z;
+    current_state_[0] = msg->pose.pose.position.x;
+    current_state_[1] = msg->pose.pose.position.y;
     current_state_[2] = yaw;
-    current_state_[3] = vr;
-    current_state_[4] = vl;
-    
-    // Publish marker
+    current_state_[3] = v + w * WHEELBASE / 2.0;  // vr
+    current_state_[4] = v - w * WHEELBASE / 2.0;  // vl
     publishMarker();
 }
 
 void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
     if (msg->poses.empty()) return;
-    
-    og_x_ref_.clear();
-    og_y_ref_.clear();
-    theta_ref_.clear();
-    
-    // Downsample if too many points
+    og_x_ref_.clear(); og_y_ref_.clear(); theta_ref_.clear();
     int skip = (msg->poses.size() <= 2 * (N_ + 5)) ? 1 : 2;
-    
     for (size_t i = 0; i < msg->poses.size(); i += skip) {
         og_x_ref_.push_back(msg->poses[i].pose.position.x);
         og_y_ref_.push_back(msg->poses[i].pose.position.y);
     }
-    
-    // Compute heading angles
     double center_heading = current_state_[2];
     for (size_t i = 0; i < og_x_ref_.size() - 1; ++i) {
         double dx = og_x_ref_[i+1] - og_x_ref_[i];
         double dy = og_y_ref_[i+1] - og_y_ref_[i];
-        double theta = std::atan2(dy, dx);
-        double theta_proc = headingPreprocess(center_heading, theta);
+        double theta_proc = headingPreprocess(center_heading, std::atan2(dy, dx));
+        if (i == 0) theta_ref_.push_back(theta_proc);
         theta_ref_.push_back(theta_proc);
-        
-        if (i == 0) {
-            theta_ref_.push_back(theta_proc);
-        }
         center_heading = theta_proc;
     }
 }
 
 void MPCNode::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
-    obs_x_.clear();
-    obs_y_.clear();
-    
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-    
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y) {
-        obs_x_.push_back(*iter_x);
-        obs_y_.push_back(*iter_y);
+    obs_x_.clear(); obs_y_.clear();
+    sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y");
+    for (; ix != ix.end(); ++ix, ++iy) {
+        if (!std::isfinite(*ix) || !std::isfinite(*iy)) continue;
+        obs_x_.push_back(*ix); obs_y_.push_back(*iy);
     }
 }
 
 void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
-    map_x_.clear();
-    map_y_.clear();
-    
-    sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
-    
-    for (; iter_x != iter_x.end(); ++iter_x, ++iter_y) {
-        map_x_.push_back(*iter_x);
-        map_y_.push_back(*iter_y);
+    map_x_.clear(); map_y_.clear();
+    sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y");
+    for (; ix != ix.end(); ++ix, ++iy) {
+        if (!std::isfinite(*ix) || !std::isfinite(*iy)) continue;
+        map_x_.push_back(*ix); map_y_.push_back(*iy);
     }
 }
 
+void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg) {
+    dynamic_obstacles_.clear();
+    for (const auto& circle : msg->circles) {
+        DynamicObstacle obs;
+        obs.x = circle.center.x; obs.y = circle.center.y;
+        obs.vx = circle.velocity.x; obs.vy = circle.velocity.y;
+        obs.radius = circle.true_radius;
+        dynamic_obstacles_.push_back(obs);
+    }
+}
+
+// =============================================================================
+// Utility
+// =============================================================================
 double MPCNode::quaternionToYaw(const geometry_msgs::Quaternion& q) {
-    double q0 = q.x;
-    double q1 = q.y;
-    double q2 = q.z;
-    double q3 = q.w;
-    return std::atan2(2.0 * (q2 * q3 + q0 * q1), 1.0 - 2.0 * (q1 * q1 + q2 * q2));
+    return std::atan2(2.0*(q.z*q.w + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z));
 }
 
 double MPCNode::headingPreprocess(double center, double target) {
-    double min = center - M_PI;
-    double max = center + M_PI;
-    
-    while (target < min) {
-        target += 2.0 * M_PI;
-    }
-    while (target > max) {
-        target -= 2.0 * M_PI;
-    }
-    
+    while (target < center - M_PI) target += 2.0 * M_PI;
+    while (target > center + M_PI) target -= 2.0 * M_PI;
     return target;
 }
 
 double MPCNode::diffAngle(double a1, double a2) {
-    double diff = std::max(a1, a2) - std::min(a1, a2);
-    if (diff > M_PI) {
-        diff = 2.0 * M_PI - diff;
-    }
+    double diff = std::fabs(a1 - a2);
+    if (diff > M_PI) diff = 2.0 * M_PI - diff;
     return diff;
 }
 
 bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
-    // Transform obstacle to robot's local frame
-    double dx = ox - rx;
-    double dy = oy - ry;
-
-    // Rotate by -rtheta. We only care about the new Y coordinate (Lateral distance)
-    // local_y = -sin(theta)*dx + cos(theta)*dy
-    double local_y = -std::sin(rtheta) * dx + std::cos(rtheta) * dy;
-
-    return local_y > 0; // Positive Y is Left
+    double dx = ox - rx, dy = oy - ry;
+    return (-std::sin(rtheta)*dx + std::cos(rtheta)*dy) > 0;
 }
 
-bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref,
-                                   double current_theta) {
-    // Check if more than 50% of trajectory points require reversal
-    // (angle difference > pi/2 from current heading)
+bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta) {
     if (theta_ref.empty()) return false;
-    
-    int count = 0;
+    int count  = 0;
     int length = std::min(static_cast<int>(theta_ref.size()), N_);
-    
-    for (int i = 1; i < length; ++i) {
-        if (diffAngle(current_theta, theta_ref[i]) > M_PI / 2.0) {
-            count++;
-        }
-    }
-    
-    return (static_cast<double>(count) / length) > 0.5;
+    double thresh = reversal_angle_deg_ * M_PI / 180.0;
+    for (int i = 1; i < length; ++i)
+        if (diffAngle(current_theta, theta_ref[i]) > thresh) count++;
+    return (static_cast<double>(count) / length) > reversal_threshold_;
 }
 
 std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x_ref,
                                                      const std::vector<double>& y_ref,
                                                      double current_theta) {
-    // Compute reversed theta references by looking at path backwards
-    // (from point i to point i-1 instead of i to i+1)
-    std::vector<double> reverse_theta;
-    
-    if (x_ref.size() < 2) {
-        return reverse_theta;
+    std::vector<double> rev;
+    if (x_ref.size() < 2) return rev;
+    double center = current_theta;
+    for (size_t i = 0; i < std::min(static_cast<size_t>(N_), x_ref.size()-1); ++i) {
+        double dx = x_ref[i] - x_ref[i+1], dy = y_ref[i] - y_ref[i+1];
+        double t  = headingPreprocess(center, std::atan2(dy, dx));
+        rev.push_back(t); center = t;
     }
-    
-    double center_heading = current_theta;
-    
-    for (size_t i = 0; i < std::min(static_cast<size_t>(N_), x_ref.size() - 1); ++i) {
-        // Compute angle from current point to previous point (reversed direction)
-        double dx = x_ref[i] - x_ref[i + 1];
-        double dy = y_ref[i] - y_ref[i + 1];
-        double theta = std::atan2(dy, dx);
-        
-        // Preprocess to keep angle continuous
-        double theta_preprocessed = headingPreprocess(center_heading, theta);
-        reverse_theta.push_back(theta_preprocessed);
-        
-        center_heading = theta_preprocessed;
-    }
-    
-    // Add one more element for terminal reference
-    if (!reverse_theta.empty()) {
-        reverse_theta.push_back(reverse_theta.back());
-    }
-    
-    return reverse_theta;
+    if (!rev.empty()) rev.push_back(rev.back());
+    return rev;
 }
 
 void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
                                const std::vector<double>& y_ref,
-                               double curr_x, double curr_y,
-                               int& min_idx) {
+                               double curr_x, double curr_y, int& min_idx) {
     double min_dist = std::numeric_limits<double>::max();
     min_idx = 0;
-    
     for (size_t i = 0; i < x_ref.size(); ++i) {
-        double dx = x_ref[i] - curr_x;
-        double dy = y_ref[i] - curr_y;
-        double dist = std::sqrt(dx*dx + dy*dy);
-        
-        if (dist < min_dist) {
-            min_dist = dist;
-            min_idx = i;
-        }
+        double dx = x_ref[i]-curr_x, dy = y_ref[i]-curr_y;
+        double d  = dx*dx + dy*dy;
+        if (d < min_dist) { min_dist = d; min_idx = static_cast<int>(i); }
     }
 }
 
+std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
+    const std::vector<DynamicObstacle>& obstacles, double dt, int N)
+{
+    std::vector<PredictedObstacle> preds;
+    for (const auto& obs : obstacles) {
+        PredictedObstacle pred;
+        pred.x_predicted.resize(N+1);
+        pred.y_predicted.resize(N+1);
+        pred.vx_predicted.resize(N+1, obs.vx);
+        pred.vy_predicted.resize(N+1, obs.vy);
+        pred.radius_predicted.resize(N+1, dynamic_obs_radius_);
+        for (int i = 0; i <= N; ++i) {
+            pred.x_predicted[i] = obs.x + obs.vx * i * dt;
+            pred.y_predicted[i] = obs.y + obs.vy * i * dt;
+        }
+        preds.push_back(pred);
+    }
+    return preds;
+}
+
+// =============================================================================
+// RUSH_GOAL helpers
+// =============================================================================
+double MPCNode::distToGoal(double rx, double ry) const {
+    if (og_x_ref_.empty()) return std::numeric_limits<double>::max();
+    double dx = og_x_ref_.back() - rx;
+    double dy = og_y_ref_.back() - ry;
+    return std::sqrt(dx*dx + dy*dy);
+}
+
+// Warm-start for RUSH_GOAL: seed every stage with a full-speed trajectory.
+// Problem with the old approach (all stages = current_state at v~0.5):
+//   SQP-RTI runs only 1 QP iteration per cycle, so it can only take a small
+//   step away from the initial guess each solve. Starting at v=0.5 everywhere
+//   means it takes ~10-15 cycles (~0.4-0.6 s) to climb to 2.0 m/s — which is
+//   most of the 4 m RUSH_GOAL window, so the robot never actually rushes.
+//
+// Fix: build a kinematically consistent initial trajectory by propagating
+//   forward from the current pose at vr=vl=rush_vref_ (both wheels at max).
+//   This gives the QP a warm-start that is already AT full speed, so the first
+//   iteration produces a near-2.0 m/s command immediately.
+void MPCNode::warmStartFromCurrentState(const std::vector<double>& current_state) {
+    constexpr double Tf = 2.0;
+    double dt = Tf / N_;
+
+    // Build full-speed initial state trajectory: propagate differential drive
+    // dynamics at vr=vl=rush_vref_ (straight line at full speed, zero omega).
+    double vr_full = rush_vref_;
+    double vl_full = rush_vref_;
+    double v_full  = (vr_full + vl_full) / 2.0;  // = rush_vref_
+    // omega = (vr-vl)/L = 0  →  robot drives straight along current heading
+
+    double x_k   = current_state[0];
+    double y_k   = current_state[1];
+    double th_k  = current_state[2];
+
+    // u = max acceleration to reach rush_vref_ from current velocity in 1 step
+    double v_now = (current_state[3] + current_state[4]) / 2.0;
+    double ar = (rush_vref_ - current_state[3]) / dt;  // right wheel accel
+    double al = (rush_vref_ - current_state[4]) / dt;  // left  wheel accel
+    // Clamp to actuator limits (3.0 m/s² for physical, simulation go high)
+    ar = std::max(-4.0, std::min(4.0, ar));
+    al = std::max(-4.0, std::min(4.0, al));
+    double u_full[2] = {ar, al};
+
+    for (int i = 0; i <= N_; ++i) {
+        double stage_state[5] = {x_k, y_k, th_k, vr_full, vl_full};
+        // Stage 0: keep actual current state to satisfy initial constraint
+        if (i == 0) {
+            ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, 0, "x",
+                            const_cast<double*>(current_state.data()));
+        } else {
+            ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "x", stage_state);
+        }
+        // Propagate straight-line kinematics for next stage
+        x_k  += v_full * std::cos(th_k) * dt;
+        y_k  += v_full * std::sin(th_k) * dt;
+        // th_k stays constant (omega=0)
+    }
+    for (int i = 0; i < N_; ++i) {
+        ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "u", u_full);
+    }
+    ROS_INFO("RUSH_GOAL warm-start: seeded at vr=%.2f vl=%.2f (ar=%.2f al=%.2f)",
+             vr_full, vl_full, ar, al);
+}
+
+// =============================================================================
+// selectTwoObstacles
+// =============================================================================
+void MPCNode::selectTwoObstacles(
+    const std::vector<double>& obs_x,
+    const std::vector<double>& obs_y,
+    const std::vector<PredictedObstacle>& predicted_obstacles,
+    double rx, double ry,
+    int stage,
+    double search_radius_sq,
+    double p_data[4]) const
+{
+    constexpr double collinearity_thresh_rad = 30.0 * M_PI / 180.0;
+
+    struct Candidate {
+        double x, y;
+        double eff_dist;
+        double angle;
+    };
+
+    std::vector<Candidate> candidates;
+    candidates.reserve(obs_x.size() + predicted_obstacles.size());
+
+    for (size_t j = 0; j < obs_x.size(); ++j) {
+        double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
+        double d2 = dx*dx + dy*dy;
+        if (d2 > search_radius_sq) continue;
+        double d = std::sqrt(d2);
+        candidates.push_back({obs_x[j], obs_y[j], d, std::atan2(dy, dx)});
+    }
+
+    for (const auto& pred : predicted_obstacles) {
+        if (stage >= static_cast<int>(pred.x_predicted.size())) continue;
+        double px = pred.x_predicted[stage];
+        double py = pred.y_predicted[stage];
+        double pr = pred.radius_predicted[stage];
+        double dx = px - rx, dy = py - ry;
+        double dist_center = std::sqrt(dx*dx + dy*dy);
+        if (dist_center > obs_search_radius_) continue;
+        double eff_dist = std::max(0.0, dist_center - pr);
+        candidates.push_back({px, py, eff_dist, std::atan2(dy, dx)});
+    }
+
+    if (candidates.empty()) {
+        p_data[0] = p_data[2] = 1000.0;
+        p_data[1] = p_data[3] = 1000.0;
+        return;
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b){
+                  return a.eff_dist < b.eff_dist;
+              });
+
+    p_data[0] = candidates[0].x;
+    p_data[1] = candidates[0].y;
+
+    if (candidates.size() == 1) {
+        p_data[2] = candidates[0].x;
+        p_data[3] = candidates[0].y;
+        return;
+    }
+
+    bool found_slot2 = false;
+    for (size_t k = 1; k < candidates.size(); ++k) {
+        double angle_diff = std::fabs(candidates[k].angle - candidates[0].angle);
+        if (angle_diff > M_PI) angle_diff = 2.0*M_PI - angle_diff;
+        if (angle_diff > collinearity_thresh_rad) {
+            p_data[2] = candidates[k].x;
+            p_data[3] = candidates[k].y;
+            found_slot2 = true;
+            break;
+        }
+    }
+
+    if (!found_slot2) {
+        p_data[2] = candidates[1].x;
+        p_data[3] = candidates[1].y;
+    }
+}
+
+// =============================================================================
+// checkEmergencyStop
+// =============================================================================
+bool MPCNode::checkEmergencyStop(
+    const std::vector<PredictedObstacle>& predicted_obstacles,
+    const std::vector<double>& current_state) const
+{
+    const double hard_stop_dist = robot_radius_ + dynamic_obs_radius_ + 0.3;
+
+    int slot = 0;
+    for (const auto& pred : predicted_obstacles) {
+        if (pred.x_predicted.empty()) continue;
+        double dx   = pred.x_predicted[0] - current_state[0];
+        double dy   = pred.y_predicted[0] - current_state[1];
+        double dist = std::sqrt(dx*dx + dy*dy) - pred.radius_predicted[0];
+        if (dist < hard_stop_dist) {
+            ++slot;
+            if (slot > 2) {
+                ROS_WARN_THROTTLE(0.5,
+                    "Emergency stop: 3rd+ dynamic obstacle at %.2fm (threshold %.2fm)",
+                    dist, hard_stop_dist);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// =============================================================================
+// OCP Solver
+// =============================================================================
 bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& y_ref,
                        const std::vector<double>& theta_ref,
                        const std::vector<double>& current_state,
                        const std::vector<double>& obs_x,
-                       const std::vector<double>& obs_y) {
-    
+                       const std::vector<double>& obs_y)
+{
     // =========================================================================
-    // 1. SET INITIAL STATE CONSTRAINT
+    // 1. INITIAL STATE CONSTRAINT
     // =========================================================================
-    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, 
+    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
                                   "lbx", (void*)current_state.data());
-    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, 
+    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
                                   "ubx", (void*)current_state.data());
-    
+
     // =========================================================================
-    // 2. DETERMINE CONTROL MODE (SAFE / CAREFUL / OBSTACLE)
+    // 2. PREDICT DYNAMIC OBSTACLES
     // =========================================================================
-    bool has_close_obstacles = false;
-    double closest_obstacle_dist = std::numeric_limits<double>::max();
-    
-    if (!obs_x.empty()) {
-        for (size_t i = 0; i < obs_x.size(); ++i) {
-            double dx = obs_x[i] - current_state[0];
-            double dy = obs_y[i] - current_state[1];
-            double dist = std::sqrt(dx*dx + dy*dy);
-            
-            if (dist < closest_obstacle_dist) {
-                closest_obstacle_dist = dist;
-            }
-            
-            if (dist < SAFE_DISTANCE) {
-                has_close_obstacles = true;
-            }
-        }
+    constexpr double Tf = 2.0;
+    double dt = Tf / N_;
+    predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
+
+    // =========================================================================
+    // 3. EMERGENCY STOP CHECK
+    // =========================================================================
+    if (checkEmergencyStop(predicted_obstacles_, current_state)) {
+        return false;
     }
-    
-    // FIXED: More intuitive mode selection logic
-    // Variables renamed for clarity:
-    // - v_linear_limit: the actual velocity constraint applied to the solver
-    // - v_target: the desired reference velocity for tracking
-    
-    double v_linear_limit;  // Velocity constraint for solver [m/s]
-    double v_target;        // Target velocity for cost function [m/s]
-    
-    if (!has_close_obstacles) {
-        // SAFE MODE: No obstacles within SAFE_DISTANCE
-        mode_ = ControlMode::SAFE;
-        v_linear_limit = v_linear_max_;           // Full speed: 2.0 m/s
-        v_target = v_linear_max_ * 0.85;          // Target: 1.5 m/s
-        weight_acceleration_ = 1.0;
-        display_text_ = "SAFE";
-        ROS_INFO_THROTTLE(2.0, "Mode: SAFE (closest obs: %.2fm)", closest_obstacle_dist);
-    } else if (closest_obstacle_dist < SAFE_DISTANCE * 0.5) {
-        // CAREFUL MODE: Obstacles very close (within half of SAFE_DISTANCE)
-        mode_ = ControlMode::CAREFUL;
-        v_linear_limit = v_linear_max_ * 0.5;     // Limit: 1.0 m/s
-        v_target = v_linear_max_ * 0.375;         // Target: 0.75 m/s
-        weight_acceleration_ = 0.1;
-        display_text_ = "CAREFUL";
-        ROS_WARN_THROTTLE(2.0, "Mode: CAREFUL (closest obs: %.2fm)", closest_obstacle_dist);
+
+    // =========================================================================
+    // 4. MODE DETECTION
+    //    Priority: DYNAMIC_OBS > RUSH_GOAL > STATIC_OBS > NORMAL
+    //    RUSH_GOAL only fires when STATIC_OBS would be active (static obstacles
+    //    nearby) AND the robot is within rush_goal_dist_ of the path end.
+    //    Dynamic obstacles suppress RUSH_GOAL entirely for safety.
+    // =========================================================================
+    bool has_dynamic_obs = false;
+    double closest_dynamic_dist = std::numeric_limits<double>::max();
+    for (const auto& pred : predicted_obstacles_) {
+        if (pred.x_predicted.empty()) continue;
+        double dx   = pred.x_predicted[0] - current_state[0];
+        double dy   = pred.y_predicted[0] - current_state[1];
+        double dist = std::sqrt(dx*dx + dy*dy) - pred.radius_predicted[0];
+        if (dist < closest_dynamic_dist) closest_dynamic_dist = dist;
+        if (dist < dynamic_obs_safe_dist_) has_dynamic_obs = true;
+    }
+
+    bool has_static_obs = false;
+    double closest_static_dist = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < obs_x.size(); ++i) {
+        double dx   = obs_x[i] - current_state[0];
+        double dy   = obs_y[i] - current_state[1];
+        double dist = std::sqrt(dx*dx + dy*dy);
+        if (dist < closest_static_dist) closest_static_dist = dist;
+        if (dist < static_obs_safe_dist_) has_static_obs = true;
+    }
+
+    double goal_dist = distToGoal(current_state[0], current_state[1]);
+    bool near_goal   = (goal_dist < rush_goal_dist_);
+
+    // --- RUSH_GOAL latch management ---
+    // Trigger conditions (either is sufficient — both mean "commit to the goal"):
+    //   A) Static obstacle nearby AND near goal  → was navigating through obstacles, now close
+    //   B) No static obs, no dynamic obs, near goal → path is clear, still close to goal
+    //      (covers the STATIC→NORMAL→goal case where the last obstacle was passed)
+    // Unlatch only when:
+    //   (a) a dynamic obstacle appears (safety), or
+    //   (b) the goal is essentially reached (rush_goal_exit_dist_).
+    const bool trigger_rush = near_goal && !has_dynamic_obs;
+
+    if (has_dynamic_obs) {
+        rush_goal_latched_ = false;
+    } else if (trigger_rush) {
+        rush_goal_latched_ = true;
+    } else if (rush_goal_latched_ && goal_dist < rush_goal_exit_dist_) {
+        rush_goal_latched_ = false;
+        ROS_INFO("RUSH_GOAL: goal reached, releasing latch (dist=%.2fm)", goal_dist);
+    }
+
+    if (has_dynamic_obs) {
+        mode_ = ControlMode::DYNAMIC_OBS;
+        display_text_ = "DYNAMIC_OBS";
+        ROS_INFO_THROTTLE(1.0, "Mode: DYNAMIC_OBS (closest=%.2fm)", closest_dynamic_dist);
+    } else if (rush_goal_latched_) {
+        mode_ = ControlMode::RUSH_GOAL;
+        display_text_ = "RUSH_GOAL";
+        ROS_INFO_THROTTLE(0.5, "Mode: RUSH_GOAL (goal=%.2fm, static_obs=%.2fm)",
+                          goal_dist, closest_static_dist);
+    } else if (has_static_obs) {
+        mode_ = ControlMode::STATIC_OBS;
+        display_text_ = "STATIC_OBS";
+        ROS_INFO_THROTTLE(1.0, "Mode: STATIC_OBS (closest=%.2fm)", closest_static_dist);
     } else {
-        // OBSTACLE MODE: Obstacles present but not very close
-        mode_ = ControlMode::OBSTACLE;
-        v_linear_limit = v_linear_max_ * 0.85;    // Limit: 1.5 m/s
-        v_target = v_linear_max_ * 0.7;         // Target: 1.25 m/s
-        weight_acceleration_ = 0.1;
-        display_text_ = "OBSTACLE";
-        ROS_INFO_THROTTLE(2.0, "Mode: OBSTACLE (closest obs: %.2fm)", closest_obstacle_dist);
+        mode_ = ControlMode::NORMAL;
+        display_text_ = "NORMAL";
+        ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
     }
-    
-    // Handle Reversal Mode Logic
-    reverse_mode_ = false;
+
+    // =========================================================================
+    // 5. RUSH_GOAL WARM-START
+    //    On the first iteration transitioning into RUSH_GOAL we flush the warm
+    //    start so the SQP-RTI does not inherit the slow, curved STATIC_OBS
+    //    trajectory.  Without this the solver sometimes oscillates for 3-5
+    //    cycles while it unwinds the old solution.
+    // =========================================================================
+    if (mode_ == ControlMode::RUSH_GOAL && !prev_was_rush_goal_) {
+        ROS_INFO("RUSH_GOAL: warm-starting solver from current state");
+        warmStartFromCurrentState(current_state);
+    }
+    prev_was_rush_goal_ = (mode_ == ControlMode::RUSH_GOAL);
+
+    // =========================================================================
+    // 6. MODE-SPECIFIC CONFIG
+    // =========================================================================
+    double v_cap, omega_cap, effective_accel_weight;
+    double eff_pos_weight, eff_heading_weight, eff_velocity_weight;
+
+    switch (mode_) {
+        case ControlMode::RUSH_GOAL:
+            // Full speed. Obstacles cleared from params (step 10).
+            // Direct absolute weights — velocity weight dominates so the solver
+            // prioritises hitting rush_vref_ (2.0 m/s) over xy micro-correction.
+            v_cap                  = v_linear_max_;
+            omega_cap              = omega_max_;
+            eff_pos_weight         = rush_weight_position_;
+            eff_heading_weight     = rush_weight_heading_;
+            eff_velocity_weight    = rush_weight_velocity_;
+            effective_accel_weight = rush_weight_accel_;
+            break;
+
+        case ControlMode::STATIC_OBS:
+            v_cap                  = v_static_obs_max_;
+            omega_cap              = omega_static_obs_max_;
+            effective_accel_weight = weight_acceleration_ * accel_weight_mult_static_;
+            eff_pos_weight         = weight_position_error_;
+            eff_heading_weight     = weight_heading_error_;
+            eff_velocity_weight    = weight_velocity_;
+            break;
+
+        case ControlMode::DYNAMIC_OBS:
+            v_cap                  = v_linear_max_;
+            omega_cap              = omega_max_;
+            effective_accel_weight = weight_acceleration_ * accel_weight_mult_dynamic_;
+            eff_pos_weight         = weight_position_error_;
+            eff_heading_weight     = weight_heading_error_;
+            eff_velocity_weight    = weight_velocity_;
+            break;
+
+        default: // NORMAL
+            v_cap                  = v_linear_max_;
+            omega_cap              = omega_max_;
+            effective_accel_weight = weight_acceleration_;
+            eff_pos_weight         = weight_position_error_;
+            eff_heading_weight     = weight_heading_error_;
+            eff_velocity_weight    = weight_velocity_;
+            break;
+    }
+
+    // =========================================================================
+    // 7. REVERSAL OVERLAY
+    // =========================================================================
     std::vector<double> effective_theta_ref = theta_ref;
-    
-    if ((mode_ == ControlMode::CAREFUL || mode_ == ControlMode::OBSTACLE) && 
-        checkReversalNeeded(theta_ref, current_state[2])) {
-        reverse_mode_ = true;
+    in_reversal_ = checkReversalNeeded(theta_ref, current_state[2]);
+    if (in_reversal_) {
         reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
         effective_theta_ref = reverse_theta_ref_;
-        display_text_ = "REVERSING";
-        ROS_INFO_THROTTLE(1.0, "Reversal mode activated");
+        display_text_ = "REV+" + display_text_;
+        ROS_INFO_THROTTLE(1.0, "Reversal overlay active");
     }
 
     // =========================================================================
-    // 3. UPDATE CONSTRAINT BOUNDS
+    // 8. CONSTRAINT BOUNDS
+    //    In RUSH_GOAL we use the full NORMAL velocity envelope so the solver is
+    //    not velocity-capped.  Obstacle distance constraints are effectively
+    //    deactivated by parking the obstacle parameters far away (step 9),
+    //    but we still keep the h-constraint structure valid.
     // =========================================================================
-    // FIXED: Now correctly constrains v_linear (not vr+vl)
-    // h_expr = [(vr+vl)/2, (vr-vl)/L, dist_L_sq, dist_R_sq]
-    //          [v_linear,  omega,     dist_L,    dist_R   ]
-    
-    double omega_limit = 0.8;  // Angular velocity limit [rad/s]
-    double dist_bound = min_obstacle_distance_ * min_obstacle_distance_;
-    
-    // Construct the bounds arrays (Size 4)
-    double lh[4] = {-v_linear_limit, -omega_limit, dist_bound, dist_bound};
-    double uh[4] = {v_linear_limit, omega_limit, 1.0e9, 1.0e9};
+    double min_dist_sq;
+    if (mode_ == ControlMode::DYNAMIC_OBS) {
+        min_dist_sq = std::pow(robot_radius_ + dynamic_obs_radius_ + safety_margin_, 2.0);
+    } else {
+        // NORMAL, STATIC_OBS, RUSH_GOAL — robot footprint only
+        min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
+    }
+    double lh[4] = { -v_cap, -omega_cap, min_dist_sq, min_dist_sq };
+    double uh[4] = {  v_cap,  omega_cap, 1.0e9,       1.0e9 };
 
-    // Update bounds for stages 0 to N-1
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
     }
 
     // =========================================================================
-    // 4. UPDATE COST WEIGHTS (W Matrix)
+    // 9. COST WEIGHTS — ny = 6: [x, y, theta, v_linear, ar, al]
+    //    Terminal cost W_e covers [x, y, theta] only (ny_e = 3).
+    //    In RUSH_GOAL: boost terminal velocity cost by adding it to stage costs
+    //    with a very high weight so SQP-RTI is strongly pulled toward rush_vref_.
+    //    No hard velocity floor (causes infeasibility near obstacles).
     // =========================================================================
-    // The W matrix is (nx + nu) x (nx + nu). For this robot: 5 + 2 = 7x7.
-    int ny = nx_ + nu_;
+    int ny = 4 + nu_;  // 6
     std::vector<double> W(ny * ny, 0.0);
-    
-    // Fill the diagonal.
-    // Index mapping: 0:x, 1:y, 2:theta, 3:vr, 4:vl, 5:ar, 6:al
-    W[0 * ny + 0] = weight_position_error_;
-    W[1 * ny + 1] = weight_position_error_;
-    W[2 * ny + 2] = 1.0;                    
-    W[3 * ny + 3] = weight_velocity_ref_;   
-    W[4 * ny + 4] = weight_velocity_ref_;   
-    W[5 * ny + 5] = weight_acceleration_;   // Dynamic!
-    W[6 * ny + 6] = weight_acceleration_;   // Dynamic!
-    
-    for (int i = 0; i < N_; ++i) {
+    W[0*ny+0] = eff_pos_weight;
+    W[1*ny+1] = eff_pos_weight;
+    W[2*ny+2] = eff_heading_weight;
+    W[3*ny+3] = eff_velocity_weight;
+    W[4*ny+4] = effective_accel_weight;
+    W[5*ny+5] = effective_accel_weight;
+
+    for (int i = 0; i < N_; ++i)
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
+
+    // Terminal cost W_e: [x, y, theta] — ny_e = 3
+    // In RUSH_GOAL crank up position weight at terminal stage so the solver
+    // commits to reaching the goal position (velocity is already handled per-stage).
+    {
+        int ny_e = 3;
+        std::vector<double> W_e(ny_e * ny_e, 0.0);
+        if (mode_ == ControlMode::RUSH_GOAL) {
+            W_e[0*ny_e+0] = rush_weight_position_;
+            W_e[1*ny_e+1] = rush_weight_position_;
+            W_e[2*ny_e+2] = rush_weight_heading_;
+        } else {
+            W_e[0*ny_e+0] = eff_pos_weight;
+            W_e[1*ny_e+1] = eff_pos_weight;
+            W_e[2*ny_e+2] = eff_heading_weight;
+        }
+        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "W", W_e.data());
     }
 
     // =========================================================================
-    // 5. PER-STAGE UPDATE: REFERENCE & INDEPENDENT OBSTACLES
+    // 10. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
     // =========================================================================
     double search_radius_sq = obs_search_radius_ * obs_search_radius_;
 
+    // In RUSH_GOAL we clear all obstacle slots to avoid the obstacle repulsion
+    // costs fighting the high-speed goal rush.  The robot's own collision
+    // geometry (robot_radius_ + safety_margin_) still enforces the hard lower
+    // bound on the distance constraint, so this is NOT safety-critical — it
+    // merely removes the gradient pulling the solver away from the goal path.
+    const bool clear_obstacles = (mode_ == ControlMode::RUSH_GOAL);
+
     for (int i = 0; i <= N_; ++i) {
-        // --- A. GET REFERENCE POINT FOR THIS STAGE ---
-        int ref_idx = std::min(i, static_cast<int>(x_ref.size()) - 1);
-        int theta_ref_idx = std::min(i, static_cast<int>(effective_theta_ref.size()) - 1);
-        
-        double stage_x = x_ref[ref_idx];
-        double stage_y = y_ref[ref_idx];
-        double stage_theta = effective_theta_ref[theta_ref_idx];
+        int ref_idx   = std::min(i, static_cast<int>(x_ref.size())-1);
+        int theta_idx = std::min(i, static_cast<int>(effective_theta_ref.size())-1);
 
-        // --- B. SET COST REFERENCE (yref) ---
-        if (i < N_) {
-            // FIXED: Clearer velocity reference calculation
-            // Convert v_target to wheel velocities
-            double vr_target = reverse_mode_ ? (-v_target * reversa_alpha) : v_target;
-            double vl_target = vr_target;  // Both wheels same for straight motion
-            
-            double y_ref_stage[7];
-            y_ref_stage[0] = stage_x;
-            y_ref_stage[1] = stage_y;
-            y_ref_stage[2] = stage_theta;
-            y_ref_stage[3] = vr_target;
-            y_ref_stage[4] = vl_target;
-            y_ref_stage[5] = 0.0;
-            y_ref_stage[6] = 0.0;
-            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", y_ref_stage);
+        double sx = x_ref[ref_idx];
+        double sy = y_ref[ref_idx];
+        double st = effective_theta_ref[theta_idx];
+
+        double rx, ry;
+        if (i == 0) {
+            rx = current_state[0];
+            ry = current_state[1];
         } else {
-            double y_ref_e[5];
-            y_ref_e[0] = stage_x;
-            y_ref_e[1] = stage_y;
-            y_ref_e[2] = stage_theta;
-            y_ref_e[3] = 0.0;
-            y_ref_e[4] = 0.0;
-            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", y_ref_e);
+            double xs[5];
+            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
+            rx = xs[0];
+            ry = xs[1];
         }
 
-        // --- C. FIND CLOSEST LEFT & RIGHT OBSTACLES ---
-        std::vector<double> obs_L = {1000.0, 1000.0}; 
-        std::vector<double> obs_R = {1000.0, 1000.0}; 
-        double min_dist_L = std::numeric_limits<double>::max();
-        double min_dist_R = std::numeric_limits<double>::max();
-
-        if (!obs_x.empty()) {
-            for(size_t j = 0; j < obs_x.size(); ++j) {
-                double d2 = std::pow(obs_x[j] - stage_x, 2) + std::pow(obs_y[j] - stage_y, 2);
-                if (d2 > search_radius_sq) continue;
-                
-                if (isLeft(stage_x, stage_y, stage_theta, obs_x[j], obs_y[j])) {
-                    if (d2 < min_dist_L) {
-                        min_dist_L = d2;
-                        obs_L[0] = obs_x[j];
-                        obs_L[1] = obs_y[j];
-                    }
-                } else {
-                    if (d2 < min_dist_R) {
-                        min_dist_R = d2;
-                        obs_R[0] = obs_x[j];
-                        obs_R[1] = obs_y[j];
-                    }
-                }
-            }
+        // Set stage reference
+        if (i < N_) {
+            // v_ref: RUSH_GOAL uses rush_vref_ (explicit 2.0 m/s target).
+            // STATIC_OBS uses v_static_obs_max_. All others use v_linear_max_.
+            double v_ref;
+            if (mode_ == ControlMode::RUSH_GOAL)       v_ref = rush_vref_;
+            else if (mode_ == ControlMode::STATIC_OBS) v_ref = v_static_obs_max_;
+            else                                        v_ref = v_linear_max_;
+            double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
+            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref);
+        } else {
+            double yref_e[3] = { sx, sy, st };
+            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        // --- D. UPDATE ACADOS PARAMETERS ---
+        // Obstacle parameters
         double p_data[4];
-        p_data[0] = obs_L[0];
-        p_data[1] = obs_L[1];
-        p_data[2] = obs_R[0];
-        p_data[3] = obs_R[1];
-        
-        // Use the correct function for parameter update
-        if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0) {
-            jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        if (clear_obstacles) {
+            // Park both obstacle slots far away — constraints are structurally
+            // present but produce near-zero gradient (obstacle is 1000 m away).
+            p_data[0] = 1000.0; p_data[1] = 1000.0;
+            p_data[2] = 1000.0; p_data[3] = 1000.0;
+        } else {
+            selectTwoObstacles(obs_x, obs_y, predicted_obstacles_,
+                               rx, ry, i, search_radius_sq, p_data);
         }
+
+        if (ocp_nlp_dims_get_from_attr(nlp_config_, nlp_dims_, nlp_out_, i, "np") > 0)
+            jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
     }
-    
+
     // =========================================================================
-    // 6. SOLVE
+    // 11. SOLVE
     // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
-    
     if (status != 0) {
         ROS_WARN("ACADOS solver failed with status %d", status);
         return false;
     }
-    
+
     // =========================================================================
-    // 7. EXTRACT SOLUTION
+    // 12. EXTRACT SOLUTION
     // =========================================================================
-    double u_opt[2];
-    ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "u", u_opt);
-    
     double x_opt[5];
     ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 1, "x", x_opt);
-    
-    double vr_opt = x_opt[3];
-    double vl_opt = x_opt[4];
-    v_opt_ = (vr_opt + vl_opt) / 2.0;
-    w_opt_ = (vr_opt - vl_opt) / WHEELBASE;
-    
+    v_opt_ = (x_opt[3] + x_opt[4]) / 2.0;
+    w_opt_ = (x_opt[3] - x_opt[4]) / WHEELBASE;
+
     std::vector<double> x_traj, y_traj;
     for (int i = 0; i < N_; ++i) {
-        double x_stage[5];
-        ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", x_stage);
-        x_traj.push_back(x_stage[0]);
-        y_traj.push_back(x_stage[1]);
+        double xs[5];
+        ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
+        x_traj.push_back(xs[0]); y_traj.push_back(xs[1]);
     }
     publishTrajectory(x_traj, y_traj);
-    
     return true;
 }
 
+// =============================================================================
+// Publishers
+// =============================================================================
 void MPCNode::publishVelocity(double v, double w) {
-    geometry_msgs::Twist vel_msg;
-    vel_msg.linear.x = v;
-    vel_msg.angular.z = w;
-    pub_vel_.publish(vel_msg);
+    geometry_msgs::Twist msg;
+    msg.linear.x  = v;
+    msg.angular.z = w;
+    pub_vel_.publish(msg);
 }
 
 void MPCNode::publishTrajectory(const std::vector<double>& x_traj,
                                 const std::vector<double>& y_traj) {
-    nav_msgs::Path path_msg;
-    path_msg.header.stamp = ros::Time::now();
-    path_msg.header.frame_id = "odom";
-    
+    nav_msgs::Path path;
+    path.header.stamp    = ros::Time::now();
+    path.header.frame_id = "odom";
     for (size_t i = 0; i < x_traj.size(); ++i) {
-        geometry_msgs::PoseStamped pose;
-        pose.pose.position.x = x_traj[i];
-        pose.pose.position.y = y_traj[i];
-        pose.pose.orientation.w = 1.0;
-        path_msg.poses.push_back(pose);
+        geometry_msgs::PoseStamped ps;
+        ps.pose.position.x = x_traj[i];
+        ps.pose.position.y = y_traj[i];
+        ps.pose.orientation.w = 1.0;
+        path.poses.push_back(ps);
     }
-    
-    pub_mpc_plan_.publish(path_msg);
+    pub_mpc_plan_.publish(path);
 }
 
 void MPCNode::publishMarker() {
-    visualization_msgs::Marker marker;
-    marker.header.frame_id = "odom";
-    marker.header.stamp = ros::Time::now();
-    marker.type = visualization_msgs::Marker::SPHERE;
-    marker.action = visualization_msgs::Marker::ADD;
-    
-    marker.pose.position.x = current_state_[0] + 0.5;
-    marker.pose.position.y = current_state_[1];
-    marker.pose.position.z = 0.0;
-    marker.pose.orientation.w = 1.0;
-    
-    marker.scale.x = 0.2;
-    marker.scale.y = 0.2;
-    marker.scale.z = 0.2;
-    
-    marker.color.a = 1.0;
-    if (reverse_mode_) {
-        // Blue for reversal mode
-        marker.color.r = 0.0;
-        marker.color.g = 0.0;
-        marker.color.b = 1.0;
-    } else if (mode_ == ControlMode::SAFE) {
-        // Green for safe mode
-        marker.color.r = 0.0;
-        marker.color.g = 1.0;
-        marker.color.b = 0.0;
-    } else if (mode_ == ControlMode::OBSTACLE) {
-        // Yellow for obstacle mode
-        marker.color.r = 1.0;
-        marker.color.g = 1.0;
-        marker.color.b = 0.0;
-    } else {
-        // Red for careful mode
-        marker.color.r = 1.0;
-        marker.color.g = 0.0;
-        marker.color.b = 0.0;
+    visualization_msgs::Marker m;
+    m.header.frame_id = "odom";
+    m.header.stamp    = ros::Time::now();
+    m.ns = "mpc_mode"; m.id = 0;
+    m.type   = visualization_msgs::Marker::SPHERE;
+    m.action = visualization_msgs::Marker::ADD;
+    m.pose.position.x = current_state_[0] + 0.5;
+    m.pose.position.y = current_state_[1];
+    m.pose.position.z = 0.0;
+    m.pose.orientation.w = 1.0;
+    m.scale.x = m.scale.y = m.scale.z = 0.3;
+    m.color.a = 1.0;
+    switch (mode_) {
+        case ControlMode::NORMAL:      m.color.r=0.0; m.color.g=1.0; m.color.b=0.0; break;
+        case ControlMode::STATIC_OBS:  m.color.r=1.0; m.color.g=0.5; m.color.b=0.0; break;
+        case ControlMode::DYNAMIC_OBS: m.color.r=1.0; m.color.g=0.0; m.color.b=0.0; break;
+        case ControlMode::RUSH_GOAL:   m.color.r=0.5; m.color.g=0.0; m.color.b=1.0; break;  // purple
     }
-    
-    pub_marker_.publish(marker);
-    
-    // Text marker
-    marker.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-    marker.text = "V: " + std::to_string(v_opt_).substr(0, 5) + 
-                  " W: " + std::to_string(w_opt_).substr(0, 5) + 
-                  "\n" + display_text_;
-    marker.scale.z = 0.2;
-    pub_marker_.publish(marker);
+    pub_marker_.publish(m);
+    m.id = 1;
+    m.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+    m.pose.position.z = 0.5;
+    m.scale.x = m.scale.y = 0.0; m.scale.z = 0.25;
+    m.text = "V:" + std::to_string(v_opt_).substr(0,5) +
+             " W:" + std::to_string(w_opt_).substr(0,5) +
+             "\n" + display_text_;
+    pub_marker_.publish(m);
 }
 
+// =============================================================================
+// Main loop
+// =============================================================================
 void MPCNode::run() {
     std::lock_guard<std::mutex> lock(solver_mutex_);
     try {
-        // Find closest point on reference trajectory
-        if (og_x_ref_.empty() || theta_ref_.empty()) {
-            return;
-        }
-        
+        if (og_x_ref_.empty() || theta_ref_.empty()) return;
+
         int min_idx = 0;
-        findClosestPoint(og_x_ref_, og_y_ref_, 
-                        current_state_[0], current_state_[1], min_idx);
-        
-        // Extract reference from closest point
-        x_ref_.clear();
-        y_ref_.clear();
+        findClosestPoint(og_x_ref_, og_y_ref_, current_state_[0], current_state_[1], min_idx);
+
+        x_ref_.clear(); y_ref_.clear();
         for (size_t i = min_idx; i < og_x_ref_.size(); ++i) {
             x_ref_.push_back(og_x_ref_[i]);
             y_ref_.push_back(og_y_ref_[i]);
         }
-        
-        // Check if we have enough reference points
-        if (x_ref_.size() <= static_cast<size_t>(N_)) {
-            if (x_ref_.empty()) {
-                publishVelocity(0.0, 0.0);
-                return;
-            }
-            
-            // Pad with the goal point
-            double goal_x = x_ref_.back();
-            double goal_y = y_ref_.back();
-            while (x_ref_.size() <= static_cast<size_t>(N_)) {
-                x_ref_.push_back(goal_x);
-                y_ref_.push_back(goal_y);
-            }
-            ROS_INFO("Extended path to goal: %zu points", x_ref_.size());
-        }
-        
-        // Prepare theta reference from closest point
-        std::vector<double> theta_ref_subset;
-        for (size_t i = min_idx; i < theta_ref_.size(); ++i) {
-            theta_ref_subset.push_back(theta_ref_[i]);
+        if (x_ref_.empty()) { publishVelocity(0.0, 0.0); return; }
+
+        double gx = x_ref_.back(), gy = y_ref_.back();
+        while (x_ref_.size() <= static_cast<size_t>(N_)) {
+            x_ref_.push_back(gx); y_ref_.push_back(gy);
         }
 
-        // Pad theta if needed
-        while (theta_ref_subset.size() < x_ref_.size()) {
-            theta_ref_subset.push_back(theta_ref_subset.back());
-        }
-        
-        // Combine obstacles
-        std::vector<double> all_obs_x = obs_x_;
-        std::vector<double> all_obs_y = obs_y_;
+        std::vector<double> theta_sub;
+        for (size_t i = min_idx; i < theta_ref_.size(); ++i)
+            theta_sub.push_back(theta_ref_[i]);
+        while (theta_sub.size() < x_ref_.size())
+            theta_sub.push_back(theta_sub.back());
+
+        std::vector<double> all_obs_x, all_obs_y;
+        all_obs_x.insert(all_obs_x.end(), obs_x_.begin(), obs_x_.end());
         all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
+        all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
-        
-        // Solve MPC
-        bool success = solveOCP(x_ref_, y_ref_, theta_ref_subset, 
-                               current_state_, all_obs_x, all_obs_y);
-        
+
+        bool success = solveOCP(x_ref_, y_ref_, theta_sub,
+                                current_state_, all_obs_x, all_obs_y);
         if (success) {
             publishVelocity(v_opt_, w_opt_);
-            ROS_INFO("V: %.3f, W: %.3f, Mode: %s", v_opt_, w_opt_, display_text_.c_str());
+            ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f", display_text_.c_str(), v_opt_, w_opt_);
         } else {
+            v_opt_ = 0.0; w_opt_ = 0.0;
             publishVelocity(0.0, 0.0);
-            ROS_WARN("MPC solve failed, stopping");
+            ROS_WARN("MPC solve failed — stopping robot");
         }
-        
     } catch (const std::exception& e) {
         ROS_ERROR("Exception in MPC run: %s", e.what());
+        publishVelocity(0.0, 0.0);
     }
 }
 
 } // namespace mpc_controller
 
+// =============================================================================
+// main
+// =============================================================================
 int main(int argc, char** argv) {
     ros::init(argc, argv, "nmpc");
-    
     ros::NodeHandle nh;
     ros::NodeHandle nh_private("~");
-    
     mpc_controller::MPCNode mpc_node(nh, nh_private);
-
-    double mpc_rate_;
-    nh_private.param<double>("mpc_rate", mpc_rate_, 30.0);
-    ros::Rate rate(mpc_rate_);
+    double mpc_rate = 30.0;
+    nh_private.param<double>("mpc_rate", mpc_rate, 25.0);
+    ros::Rate rate(mpc_rate);
     ros::Duration(1.0).sleep();
-    
-    ROS_INFO("Non-Linear MPC Node running with ACADOS");
-    
+    ROS_INFO("Non-Linear MPC Node running at %.1f Hz", mpc_rate);
     while (ros::ok()) {
         ros::spinOnce();
         mpc_node.run();
         rate.sleep();
     }
-    
     return 0;
 }

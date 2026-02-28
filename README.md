@@ -5,7 +5,7 @@
 1) Clone this repo
 ```
 cd ~/jackal_ws/src
-git clone git@github.com:Team-Robo/mode-switching-mpc-2026.git
+git clone https://github.com/Team-Robo/mode-switching-mpc-2026.git
 ```
 
 2) Install `acados`
@@ -42,7 +42,13 @@ sudo rosdep init; rosdep update --rosdistro $ROS_DISTRO # if never done before
 rosdep install -y --from-paths src --ignore-src --rosdistro=$ROS_DISTRO
 ```
 
-7) Build
+7) Setup Obstacle Tracking
+```
+cd ~/jackal_ws/src
+git clone https://github.com/Team-Robo/obstacle_detector
+```
+
+8) Build
 ```
 cd ~/jackal_ws
 catkin_make

@@ -1,4 +1,10 @@
 <launch>
+    <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
+        <arg name="rviz" value="true"/>
+        <arg name="tracker_bridge" value="false"/>
+    </include>
+    <!-- <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/> -->
+
     <!-- Start the navigation stack -->
     <!-- The configuration files are loaded from jackal_helper -->
     <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
