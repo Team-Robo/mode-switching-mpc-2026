@@ -5,6 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Global Options1
+        - /GlobalPlan1
       Splitter Ratio: 0.5
     Tree Height: 555
   - Class: rviz/Selection
@@ -367,5 +368,5 @@ Window Geometry:
   Views:
     collapsed: false
   Width: 1200
-  X: 57
-  Y: 4
+  X: 25
+  Y: -28

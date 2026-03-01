@@ -1,4 +1,7 @@
 <launch>
+
+  <!-- <param name="global_plan_topic" value="/move_base/HybridAStarPlanner/plan" /> -->
+
     <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
         <arg name="rviz" value="true"/>
         <arg name="tracker_bridge" value="false"/>
@@ -25,8 +28,10 @@
             command="load" />
         <rosparam file="$(find jackal_helper)/configs/params/move_base_params.yaml" command="load" />
 
-        <param name="base_global_planner" type="string" value="navfn/NavfnROS" />
+        <!-- <param name="base_global_planner" type="string" value="hybrid_astar_planner/HybridAStarPlanner" /> -->
         <!-- <param name="base_global_planner" type="string" value="carrot_planner/CarrotPlanner" /> -->
+        <param name="base_global_planner" type="string" value="navfn/NavfnROS" />
+
 
         <param name="base_local_planner" value="base_local_planner/TrajectoryPlannerROS" />
         <param name="NavfnROS/default_tolerance" value="0.1" />
