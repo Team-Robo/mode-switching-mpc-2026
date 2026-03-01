@@ -38,6 +38,11 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
     nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
 
+    // ROTATION_SHIM params
+    nh_private_.param<double>("lidar_blind_angle_deg", lidar_blind_angle_deg_, 45.0);
+    nh_private_.param<double>("shim_exit_heading_deg", shim_exit_heading_deg_, 30.0);
+    nh_private_.param<double>("shim_omega",             shim_omega_,            1.2);
+
     // RUSH_GOAL params — direct absolute weights, no multipliers
     nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.0);
     nh_private_.param<double>("rush_goal_exit_dist",  rush_goal_exit_dist_,  0.0);
@@ -48,7 +53,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
 
     // Dynamic obstacle hysteresis timeout
-    nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.5);
+    nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.2);
 
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
@@ -61,6 +66,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              static_obs_safe_dist_, dynamic_obs_safe_dist_);
     ROS_INFO("  Reversal: threshold=%.2f  angle=%.1f deg",
              reversal_threshold_, reversal_angle_deg_);
+    ROS_INFO("  ROTATION_SHIM: blind=%.1f deg  exit=%.1f deg  omega=%.2f rad/s",
+             lidar_blind_angle_deg_, shim_exit_heading_deg_, shim_omega_);
     ROS_INFO("  RUSH_GOAL: dist=%.1f m  pos=%.0f  hdg=%.0f  vel=%.0f  accel=%.5f  vref=%.1f",
              rush_goal_dist_, rush_weight_position_, rush_weight_heading_,
              rush_weight_velocity_, rush_weight_accel_, rush_vref_);
@@ -190,7 +197,7 @@ double MPCNode::headingPreprocess(double center, double target) {
     return target;
 }
 
-double MPCNode::diffAngle(double a1, double a2) {
+double MPCNode::diffAngle(double a1, double a2) const {
     double diff = std::fabs(a1 - a2);
     if (diff > M_PI) diff = 2.0 * M_PI - diff;
     return diff;
@@ -224,6 +231,25 @@ std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x
     }
     if (!rev.empty()) rev.push_back(rev.back());
     return rev;
+}
+
+// =============================================================================
+// ROTATION_SHIM helper
+// =============================================================================
+bool MPCNode::isGoalInBlindSpot(double robot_theta,
+                                double goal_x, double goal_y,
+                                double robot_x, double robot_y) const
+{
+    double dx = goal_x - robot_x;
+    double dy = goal_y - robot_y;
+    double angle_to_goal = std::atan2(dy, dx);
+
+    // Blind zone is centred on the robot's REAR direction.
+    double rear_dir = robot_theta + M_PI;
+    double diff = diffAngle(angle_to_goal, rear_dir);
+
+    double blind_half = lidar_blind_angle_deg_ * M_PI / 180.0;
+    return (diff < blind_half);
 }
 
 void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
@@ -463,11 +489,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // --- Dynamic obstacle hysteresis latch ---
-    // Keeps DYNAMIC_OBS active for dynamic_obs_timeout_ seconds after the tracker
-    // loses the obstacle (common at close range due to occlusion / tracker dropout).
-    // Without this, the robot can fall through to STATIC_OBS while the dynamic
-    // obstacle's lidar returns are still present in the point cloud, causing the
-    // solver to receive tighter velocity bounds mid-manoeuvre and fail.
     ros::Time now = ros::Time::now();
     if (has_dynamic_obs) {
         last_dynamic_obs_time_ = now;
@@ -490,7 +511,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     bool near_goal   = (goal_dist < rush_goal_dist_);
 
     // --- RUSH_GOAL latch management ---
-    // Only allow rush if robot is roughly facing the goal
     bool facing_goal = false;
     if (!og_x_ref_.empty()) {
         double dx_goal = og_x_ref_.back() - current_state[0];
@@ -510,6 +530,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_INFO("RUSH_GOAL: goal reached, releasing latch (dist=%.2fm)", goal_dist);
     }
 
+    // --- Primary mode assignment (priority order) ---
     if (dynamic_obs_active) {
         mode_ = ControlMode::DYNAMIC_OBS;
         display_text_ = "DYNAMIC_OBS";
@@ -535,6 +556,95 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     }
 
     // =========================================================================
+    // 4b. ROTATION_SHIM — evaluated after primary mode, overrides everything
+    //     except DYNAMIC_OBS (a moving obstacle trumps a blind-spot spin).
+    //
+    //     Triggers when a reversal is needed AND the goal direction falls inside
+    //     the lidar blind zone.  The robot spins in place until the goal clears
+    //     the blind zone edge (plus shim_exit_heading_deg_ buffer), then this
+    //     mode releases and normal reversal takes over.
+    // =========================================================================
+    if (mode_ != ControlMode::DYNAMIC_OBS) {
+        bool reversal_pending = checkReversalNeeded(theta_ref, current_state[2]);
+
+        if (reversal_pending && !og_x_ref_.empty()) {
+            double gx = og_x_ref_.back();
+            double gy = og_y_ref_.back();
+            bool in_blind = isGoalInBlindSpot(current_state[2], gx, gy,
+                                              current_state[0], current_state[1]);
+
+            // Entry: latch the shim ON and choose spin direction once.
+            if (!shim_active_ && in_blind) {
+                shim_active_ = true;
+
+                // Rotate toward whichever side brings the goal into the FOV
+                // faster — use the cross product to find which side the goal is on.
+                double dx = gx - current_state[0];
+                double dy = gy - current_state[1];
+                // Cross product z-component: positive → goal is left of heading
+                double cross = std::cos(current_state[2]) * dy
+                             - std::sin(current_state[2]) * dx;
+                shim_turn_left_ = (cross > 0.0);
+                ROS_INFO("ROTATION_SHIM engaged — turning %s (goal in blind spot)",
+                         shim_turn_left_ ? "LEFT" : "RIGHT");
+            }
+
+            // Exit: use shim_exit_heading_deg_ as an angular buffer so the goal
+            // must be clearly inside the FOV before we release (avoids chattering
+            // at the blind-zone boundary).
+            if (shim_active_) {
+                double dx = gx - current_state[0];
+                double dy = gy - current_state[1];
+                double angle_to_goal = std::atan2(dy, dx);
+                double rear_dir = current_state[2] + M_PI;
+                double diff_from_rear = diffAngle(angle_to_goal, rear_dir);
+                double clear_angle = lidar_blind_angle_deg_ * M_PI / 180.0
+                                   + shim_exit_heading_deg_ * M_PI / 180.0;
+                if (diff_from_rear >= clear_angle) {
+                    shim_active_ = false;
+                    ROS_INFO("ROTATION_SHIM released — goal now %.1f deg from rear (need >= %.1f deg)",
+                             diff_from_rear * 180.0 / M_PI, clear_angle * 180.0 / M_PI);
+                }
+            }
+        } else {
+            // No reversal needed — always clear the shim.
+            if (shim_active_) {
+                shim_active_ = false;
+                ROS_INFO("ROTATION_SHIM cleared (no reversal needed)");
+            }
+        }
+
+        if (shim_active_) {
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "ROT_SHIM";
+            ROS_INFO_THROTTLE(0.5, "Mode: ROTATION_SHIM (spinning %s)",
+                              shim_turn_left_ ? "LEFT" : "RIGHT");
+        }
+    } else {
+        // Dynamic obstacle active — disengage shim so it re-evaluates cleanly
+        // once the dynamic obstacle clears.
+        shim_active_ = false;
+    }
+
+    // =========================================================================
+    // 4c. ROTATION_SHIM EARLY-EXIT — bypass the ACADOS solver completely.
+    //
+    //     Running the solver with v_cap=0 against a warm solution that has
+    //     nonzero wheel velocities produces an infeasible QP (ACADOS_MINSTEP).
+    //     Since run() already overrides the solver output with a direct spin
+    //     command, there is zero benefit in solving — just set the outputs and
+    //     return immediately so the warm solution stays undisturbed for when
+    //     normal mode resumes.
+    // =========================================================================
+    if (mode_ == ControlMode::ROTATION_SHIM) {
+        v_opt_ = 0.0;
+        w_opt_ = shim_turn_left_ ? shim_omega_ : -shim_omega_;
+        const double ms_shim = (ros::WallTime::now() - t0).toSec() * 1e3;
+        ROS_INFO_STREAM_THROTTLE(1.0, "[BENCH] ROTATION_SHIM early-exit = " << ms_shim << " ms");
+        return true;
+    }
+
+    // =========================================================================
     // 5. RUSH_GOAL WARM-START
     // =========================================================================
     if (mode_ == ControlMode::RUSH_GOAL && !prev_was_rush_goal_) {
@@ -557,6 +667,19 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             eff_heading_weight     = rush_weight_heading_;
             eff_velocity_weight    = rush_weight_velocity_;
             effective_accel_weight = rush_weight_accel_;
+            break;
+
+        case ControlMode::ROTATION_SHIM:
+            // Pure in-place rotation — zero forward velocity, constrained omega.
+            // Position weight zeroed so the solver doesn't fight the spin with
+            // xy-tracking cost.  Heading weight boosted to help the solver converge
+            // even though we bypass its output in run().
+            v_cap                  = 0.0;
+            omega_cap              = shim_omega_;
+            effective_accel_weight = weight_acceleration_;
+            eff_pos_weight         = 0.0;
+            eff_heading_weight     = weight_heading_error_ * 3.0;
+            eff_velocity_weight    = weight_velocity_;
             break;
 
         case ControlMode::STATIC_OBS:
@@ -651,7 +774,8 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     // 10. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
     //     Build KD-tree ONCE outside the loop, then query per stage.
     // =========================================================================
-    const bool clear_obstacles = (mode_ == ControlMode::RUSH_GOAL);
+    const bool clear_obstacles = (mode_ == ControlMode::RUSH_GOAL ||
+                                  mode_ == ControlMode::ROTATION_SHIM);
 
     // Build static obstacle point cloud and KD-tree once before the stage loop
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZ>());
@@ -682,9 +806,10 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         // ---- cost reference ----
         if (i < N_) {
             double v_ref;
-            if (mode_ == ControlMode::RUSH_GOAL)       v_ref = rush_vref_;
-            else if (mode_ == ControlMode::STATIC_OBS) v_ref = v_static_obs_max_;
-            else                                        v_ref = v_linear_max_;
+            if (mode_ == ControlMode::RUSH_GOAL)         v_ref = rush_vref_;
+            else if (mode_ == ControlMode::STATIC_OBS)   v_ref = v_static_obs_max_;
+            else if (mode_ == ControlMode::ROTATION_SHIM) v_ref = 0.0;
+            else                                          v_ref = v_linear_max_;
             double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref);
         } else {
@@ -703,7 +828,6 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                 pred_x = current_state[0];
                 pred_y = current_state[1];
             } else {
-                // Grab predicted state from warm solution (previous solve)
                 double xs[5];
                 ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, i, "x", xs);
                 pred_x = xs[0];
@@ -711,7 +835,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             }
 
             std::vector<double> local_obs_x, local_obs_y;
-            if (has_static_cloud && !clear_obstacles) {
+            if (has_static_cloud) {
                 pcl::PointXYZ searchPoint(
                     static_cast<float>(pred_x),
                     static_cast<float>(pred_y),
@@ -801,10 +925,16 @@ void MPCNode::publishMarker() {
     m.scale.x = m.scale.y = m.scale.z = 0.3;
     m.color.a = 1.0;
     switch (mode_) {
-        case ControlMode::NORMAL:      m.color.r=0.0; m.color.g=1.0; m.color.b=0.0; break;
-        case ControlMode::STATIC_OBS:  m.color.r=1.0; m.color.g=0.5; m.color.b=0.0; break;
-        case ControlMode::DYNAMIC_OBS: m.color.r=1.0; m.color.g=0.0; m.color.b=0.0; break;
-        case ControlMode::RUSH_GOAL:   m.color.r=0.5; m.color.g=0.0; m.color.b=1.0; break;
+        case ControlMode::NORMAL:
+            m.color.r=0.0; m.color.g=1.0; m.color.b=0.0; break;
+        case ControlMode::STATIC_OBS:
+            m.color.r=1.0; m.color.g=0.5; m.color.b=0.0; break;
+        case ControlMode::DYNAMIC_OBS:
+            m.color.r=1.0; m.color.g=0.0; m.color.b=0.0; break;
+        case ControlMode::RUSH_GOAL:
+            m.color.r=0.5; m.color.g=0.0; m.color.b=1.0; break;
+        case ControlMode::ROTATION_SHIM:
+            m.color.r=0.0; m.color.g=0.8; m.color.b=1.0; break;  // cyan
     }
     pub_marker_.publish(m);
     m.id = 1;
@@ -851,11 +981,26 @@ void MPCNode::run() {
         all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
+
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
+
         if (success) {
-            publishVelocity(v_opt_, w_opt_);
-            ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f", display_text_.c_str(), v_opt_, w_opt_);
+            if (mode_ == ControlMode::ROTATION_SHIM) {
+                // Bypass the MPC output entirely — command a direct, steady
+                // in-place rotation.  The solver ran to keep the warm solution
+                // warm but its output is not used.
+                const double shim_w = shim_turn_left_ ? shim_omega_ : -shim_omega_;
+                v_opt_ = 0.0;
+                w_opt_ = shim_w;
+                publishVelocity(0.0, shim_w);
+                ROS_INFO_THROTTLE(0.5, "[ROT_SHIM] spinning %s at w=%.2f rad/s",
+                                  shim_turn_left_ ? "LEFT" : "RIGHT", shim_w);
+            } else {
+                publishVelocity(v_opt_, w_opt_);
+                ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f",
+                                  display_text_.c_str(), v_opt_, w_opt_);
+            }
         } else {
             v_opt_ = 0.0; w_opt_ = 0.0;
             publishVelocity(0.0, 0.0);

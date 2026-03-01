@@ -45,15 +45,18 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
-// Priority: DYNAMIC_OBS > RUSH_GOAL > STATIC_OBS > NORMAL
-// RUSH_GOAL only fires when we are already in STATIC_OBS mode AND
-// the robot is within rush_goal_dist_ of the end of the global path.
+// Priority: DYNAMIC_OBS > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
+// ROTATION_SHIM fires when a reversal is needed but the goal direction falls
+// inside the lidar blind zone — the robot spins in place until the goal is
+// visible, then hands off to normal reversal.
 enum class ControlMode {
-    NORMAL,       // No obstacles nearby — full speed cap (v_linear_max_)
-    STATIC_OBS,   // Static obstacles detected — hard-capped at v_static_obs_max_
-    DYNAMIC_OBS,  // Dynamic obstacles detected — full speed, higher accel weight
-    RUSH_GOAL     // Near goal while static obs present — blast at v_linear_max_,
-                  // obstacles cleared from ACADOS params, heavy position weight
+    NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
+    STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
+    DYNAMIC_OBS,     // Dynamic obstacles detected — full speed, higher accel weight
+    RUSH_GOAL,       // Near goal while static obs present — blast at v_linear_max_,
+                     // obstacles cleared from ACADOS params, heavy position weight
+    ROTATION_SHIM    // Reversal needed but goal in lidar blind spot — pure in-place
+                     // rotation until goal enters FOV, then releases to reversal
 };
 
 class MPCNode {
@@ -115,7 +118,7 @@ private:
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
     double headingPreprocess(double center, double target);
-    double diffAngle(double a1, double a2);
+    double diffAngle(double a1, double a2) const;
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
                             double curr_x, double curr_y, int& min_idx);
@@ -152,14 +155,18 @@ private:
     // =========================================================================
     // RUSH_GOAL helpers
     // =========================================================================
-    // Returns distance from robot to the last point of the global path.
     double distToGoal(double rx, double ry) const;
-
-    // Warm-start the ACADOS solver by reinitialising every stage's state
-    // to the current robot state and zeroing controls.  This clears the
-    // stale STATIC_OBS solution so the solver doesn't oscillate on the
-    // first RUSH_GOAL iteration.
     void warmStartFromCurrentState(const std::vector<double>& current_state);
+
+    // =========================================================================
+    // ROTATION_SHIM helpers
+    // =========================================================================
+    // Returns true if the direction from robot to goal falls inside the lidar
+    // blind zone (a cone of half-angle lidar_blind_angle_deg_ centred on the
+    // robot's rear).
+    bool isGoalInBlindSpot(double robot_theta,
+                           double goal_x, double goal_y,
+                           double robot_x, double robot_y) const;
 
     // =========================================================================
     // Robot constants (fixed)
@@ -207,26 +214,28 @@ private:
     double reversal_angle_deg_ = 90.0;
 
     // --- RUSH_GOAL ---
-    // Activates only when mode would be STATIC_OBS AND robot is within this
-    // distance of the end of the global path.
-    double rush_goal_dist_      = 4.0;    // [m] trigger distance to goal
-    double rush_goal_exit_dist_ = 0.5;   // [m] release latch once this close
-
-    // Direct absolute cost weights used ONLY in RUSH_GOAL (not multipliers).
-    // Key insight: velocity weight must dominate over position so the solver
-    // prioritises hitting v_ref=2.0 rather than micro-correcting xy error.
+    double rush_goal_dist_      = 4.0;
+    double rush_goal_exit_dist_ = 0.5;
     double rush_weight_position_   = 5000.0;
     double rush_weight_heading_    = 6000.0;
-    double rush_weight_velocity_   = 50000.0;  // dominates — solver must chase v_ref=2.0
+    double rush_weight_velocity_   = 50000.0;
     double rush_weight_accel_      = 0.00001;
     double rush_vref_              = 2.0;
-
-    // Tracks whether the previous solve was in RUSH_GOAL so we know when to
-    // issue a warm-start reset (transition from STATIC_OBS → RUSH_GOAL).
     bool   prev_was_rush_goal_  = false;
-    // Once RUSH_GOAL fires it latches ON until the robot reaches the goal
-    // (goal_dist < rush_goal_exit_dist_) or a dynamic obstacle appears.
     bool   rush_goal_latched_   = false;
+
+    // --- ROTATION_SHIM ---
+    // Half-angle (degrees) of the lidar blind zone centred on the robot rear.
+    // For a 270° FOV lidar the dead zone spans 90°, so half-angle = 45°.
+    double lidar_blind_angle_deg_ = 45.0;
+    // Exit shim once the goal has moved this many degrees clear of the blind edge
+    // (set to 0 for no hysteresis, positive for a small angular buffer).
+    double shim_exit_heading_deg_ = 30.0;
+    // Rotation speed commanded during ROTATION_SHIM [rad/s]
+    double shim_omega_            = 1.2;
+    // Runtime state: whether shim is currently engaged and which way to turn
+    bool   shim_active_     = false;
+    bool   shim_turn_left_  = true;
 
     // =========================================================================
     // Runtime state
