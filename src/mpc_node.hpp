@@ -136,16 +136,16 @@ private:
         const std::vector<DynamicObstacle>& obstacles, double dt, int N);
 
     // =========================================================================
-    // Obstacle selection
+    // Obstacle selection — 2 closest static + up to 10 dynamic (24 params)
     // =========================================================================
-    void selectTwoObstacles(
+    void selectObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
         const std::vector<PredictedObstacle>& predicted_obstacles,
         double rx, double ry,
         int stage,
         double search_radius_sq,
-        double p_data[4]) const;
+        double p_data[24]) const;
 
     // Emergency stop for 3rd+ dynamic obstacle
     bool checkEmergencyStop(

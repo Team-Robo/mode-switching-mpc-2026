@@ -337,36 +337,50 @@ void MPCNode::warmStartFromCurrentState(const std::vector<double>& current_state
 }
 
 // =============================================================================
-// selectTwoObstacles
+// selectObstacles — 2 closest static + up to 10 dynamic obstacles
+//   p_data layout: [x0,y0, x1,y1,   x2,y2, ..., x11,y11]
+//                   ^---static---^   ^-------dynamic-------^
 // =============================================================================
-void MPCNode::selectTwoObstacles(
+void MPCNode::selectObstacles(
     const std::vector<double>& obs_x,
     const std::vector<double>& obs_y,
     const std::vector<PredictedObstacle>& predicted_obstacles,
     double rx, double ry,
     int stage,
     double search_radius_sq,
-    double p_data[4]) const
+    double p_data[24]) const
 {
-    constexpr double collinearity_thresh_rad = 30.0 * M_PI / 180.0;
+    constexpr int N_STATIC  = 2;
+    constexpr int N_DYNAMIC = 10;
 
-    struct Candidate {
-        double x, y;
-        double eff_dist;
-        double angle;
-    };
-
-    std::vector<Candidate> candidates;
-    candidates.reserve(obs_x.size() + predicted_obstacles.size());
-
+    // --- 2 closest static obstacles ---
+    struct StaticCand { double x, y, dist_sq; };
+    std::vector<StaticCand> static_cands;
+    static_cands.reserve(obs_x.size());
     for (size_t j = 0; j < obs_x.size(); ++j) {
         double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
         double d2 = dx*dx + dy*dy;
         if (d2 > search_radius_sq) continue;
-        double d = std::sqrt(d2);
-        candidates.push_back({obs_x[j], obs_y[j], d, std::atan2(dy, dx)});
+        static_cands.push_back({obs_x[j], obs_y[j], d2});
+    }
+    std::partial_sort(static_cands.begin(),
+                      static_cands.begin() + std::min((int)static_cands.size(), N_STATIC),
+                      static_cands.end(),
+                      [](const StaticCand& a, const StaticCand& b){ return a.dist_sq < b.dist_sq; });
+    for (int k = 0; k < N_STATIC; ++k) {
+        if (k < (int)static_cands.size()) {
+            p_data[2*k+0] = static_cands[k].x;
+            p_data[2*k+1] = static_cands[k].y;
+        } else {
+            p_data[2*k+0] = 1000.0;
+            p_data[2*k+1] = 1000.0;
+        }
     }
 
+    // --- up to 10 dynamic obstacles (sorted by effective distance) ---
+    struct DynCand { double x, y, eff_dist; };
+    std::vector<DynCand> dyn_cands;
+    dyn_cands.reserve(predicted_obstacles.size());
     for (const auto& pred : predicted_obstacles) {
         if (stage >= static_cast<int>(pred.x_predicted.size())) continue;
         double px = pred.x_predicted[stage];
@@ -375,45 +389,19 @@ void MPCNode::selectTwoObstacles(
         double dx = px - rx, dy = py - ry;
         double dist_center = std::sqrt(dx*dx + dy*dy);
         if (dist_center > obs_search_radius_) continue;
-        double eff_dist = std::max(0.0, dist_center - pr);
-        candidates.push_back({px, py, eff_dist, std::atan2(dy, dx)});
+        dyn_cands.push_back({px, py, std::max(0.0, dist_center - pr)});
     }
-
-    if (candidates.empty()) {
-        p_data[0] = p_data[2] = 1000.0;
-        p_data[1] = p_data[3] = 1000.0;
-        return;
-    }
-
-    std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& a, const Candidate& b){
-                  return a.eff_dist < b.eff_dist;
-              });
-
-    p_data[0] = candidates[0].x;
-    p_data[1] = candidates[0].y;
-
-    if (candidates.size() == 1) {
-        p_data[2] = candidates[0].x;
-        p_data[3] = candidates[0].y;
-        return;
-    }
-
-    bool found_slot2 = false;
-    for (size_t k = 1; k < candidates.size(); ++k) {
-        double angle_diff = std::fabs(candidates[k].angle - candidates[0].angle);
-        if (angle_diff > M_PI) angle_diff = 2.0*M_PI - angle_diff;
-        if (angle_diff > collinearity_thresh_rad) {
-            p_data[2] = candidates[k].x;
-            p_data[3] = candidates[k].y;
-            found_slot2 = true;
-            break;
+    std::sort(dyn_cands.begin(), dyn_cands.end(),
+              [](const DynCand& a, const DynCand& b){ return a.eff_dist < b.eff_dist; });
+    for (int k = 0; k < N_DYNAMIC; ++k) {
+        int base = (N_STATIC + k) * 2;
+        if (k < (int)dyn_cands.size()) {
+            p_data[base+0] = dyn_cands[k].x;
+            p_data[base+1] = dyn_cands[k].y;
+        } else {
+            p_data[base+0] = 1000.0;
+            p_data[base+1] = 1000.0;
         }
-    }
-
-    if (!found_slot2) {
-        p_data[2] = candidates[1].x;
-        p_data[3] = candidates[1].y;
     }
 }
 
@@ -434,9 +422,9 @@ bool MPCNode::checkEmergencyStop(
         double dist = std::sqrt(dx*dx + dy*dy) - pred.radius_predicted[0];
         if (dist < hard_stop_dist) {
             ++slot;
-            if (slot > 2) {
+            if (slot > 10) {
                 ROS_WARN_THROTTLE(0.5,
-                    "Emergency stop: 3rd+ dynamic obstacle at %.2fm (threshold %.2fm)",
+                    "Emergency stop: 11th+ dynamic obstacle at %.2fm (threshold %.2fm)",
                     dist, hard_stop_dist);
                 return true;
             }
@@ -737,8 +725,15 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     } else {
         min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
     }
-    double lh[4] = { -v_cap, -omega_cap, min_dist_sq, min_dist_sq };
-    double uh[4] = {  v_cap,  omega_cap, 1.0e9,       1.0e9 };
+    // 14 constraints: v_linear, omega, 12 × distance_sq (2 static + 10 dynamic)
+    double lh[14] = { -v_cap, -omega_cap,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
+        min_dist_sq, min_dist_sq };
+    double uh[14] = {  v_cap,  omega_cap,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9 };
 
     for (int i = 0; i < N_; ++i) {
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
@@ -823,11 +818,10 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
         }
 
-        // ---- obstacle parameters ----
-        double p_data[4];
+        // ---- obstacle parameters — 24 values: 2 static + 10 dynamic ----
+        double p_data[24];
         if (clear_obstacles) {
-            p_data[0] = 1000.0; p_data[1] = 1000.0;
-            p_data[2] = 1000.0; p_data[3] = 1000.0;
+            for (int _k = 0; _k < 24; ++_k) p_data[_k] = 1000.0;
         } else {
             double pred_x, pred_y;
             if (i == 0) {
@@ -854,12 +848,12 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                     local_obs_y.push_back(cloud->points[idx].y);
                 }
             }
-            selectTwoObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
+            selectObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
                             pred_x, pred_y,
                             i, search_radius_sq, p_data);
         }
 
-        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 4);
+        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 24);
     }
 
     // =========================================================================
@@ -967,6 +961,7 @@ void MPCNode::run() {
         x_ref_.clear(); y_ref_.clear();
          // this mean the reference points will be at least 20cm apart, which helps the solver converge better by not fighting over closely spaced references
          // if reduced too much, the solver can struggle to find a feasible solution
+        // gap between reference points
         const double min_spacing_sq = 0.1 * 0.1;
 
         double last_x = og_x_ref_[min_idx];

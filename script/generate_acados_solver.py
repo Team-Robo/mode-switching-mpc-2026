@@ -31,8 +31,8 @@ def export_robot_model():
     
     control = vertcat(ar, al)
     
-    # Parameters: [xL, yL, xR, yR] - obstacle positions
-    p = SX.sym('p', 4)
+    # Parameters: [x0,y0, x1,y1, ..., x11,y11] - 2 static + 10 dynamic obstacle positions
+    p = SX.sym('p', 24)
     
     # Differential drive dynamics
     v = (vr + vl) / 2  # linear velocity
@@ -50,21 +50,21 @@ def export_robot_model():
     # State derivative symbolic variable
     x_dot = SX.sym('x_dot', 5)
     
-    # Distance constraints using parameters
-    p_obs_L = p[0:2]
-    p_obs_R = p[2:4]
-    dist_L_sq = (x - p_obs_L[0])**2 + (y - p_obs_L[1])**2
-    dist_R_sq = (x - p_obs_R[0])**2 + (y - p_obs_R[1])**2
+    # Distance constraints using parameters — 12 obstacles (2 static + 10 dynamic)
+    dist_sq_list = []
+    for _k in range(12):
+        _px = p[2*_k]
+        _py = p[2*_k + 1]
+        dist_sq_list.append((x - _px)**2 + (y - _py)**2)
     
     # Implicit dynamics: f_impl = x_dot - f(x, u)
     f_impl = x_dot - f_expl
     
-    # Nonlinear constraint expressions
+    # Nonlinear constraint expressions: [v_linear, omega, dist_sq_0 .. dist_sq_11]
     h_expr = vertcat(
-        (vr + vl) / 2.0,           # linear velocity constraint (v_linear)
-        (vr - vl) / L,             # angular velocity constraint (omega)
-        dist_L_sq,                 # left obstacle distance squared
-        dist_R_sq                  # right obstacle distance squared
+        (vr + vl) / 2.0,  # linear velocity constraint (v_linear)
+        (vr - vl) / L,    # angular velocity constraint (omega)
+        *dist_sq_list      # 12 obstacle distance constraints
     )
     
     # Create ACADOS model
@@ -87,8 +87,8 @@ def setup_acados_ocp():
     model, L = export_robot_model()
     ocp.model = model
     
-    ocp.dims.np = 4
-    ocp.parameter_values = np.array([1000.0, 1000.0, 1000.0, 1000.0])
+    ocp.dims.np = 24
+    ocp.parameter_values = np.array([1000.0] * 24)
     
     nx = 5   # [x, y, theta, vr, vl]
     nu = 2   # [ar, al]
@@ -150,12 +150,14 @@ def setup_acados_ocp():
     safety_margin=0.01
     min_dist_sq = (robot_radius + safety_margin)**2
 
-    ocp.constraints.lh = np.array([-v_linear_max, -omega_max, min_dist_sq, min_dist_sq])
-    ocp.constraints.uh = np.array([ v_linear_max,  omega_max, 1e9,         1e9        ])
+    # 14 constraints: v_linear, omega, 12 × distance_sq
+    ocp.constraints.lh = np.array([-v_linear_max, -omega_max] + [min_dist_sq] * 12)
+    ocp.constraints.uh = np.array([ v_linear_max,  omega_max] + [1e9]         * 12)
 
-    # Soft constraints on obstacle distances
-    ocp.constraints.idxsh = np.array([2, 3])
-    ns = 2
+    # Soft constraints on all 12 obstacle distance constraints (indices 2..13)
+    n_obs = 12
+    ocp.constraints.idxsh = np.arange(2, 2 + n_obs)
+    ns = n_obs
     ocp.constraints.ns = ns
     slack_weight   = 1000.0
     ocp.cost.zl    = slack_weight * np.ones(ns)
