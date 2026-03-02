@@ -44,7 +44,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("shim_omega",             shim_omega_,            1.2);
 
     // RUSH_GOAL params — direct absolute weights, no multipliers
-    nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.0);
+    nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.3);
     nh_private_.param<double>("rush_goal_exit_dist",  rush_goal_exit_dist_,  0.0);
     nh_private_.param<double>("rush_weight_position", rush_weight_position_, 0.0);
     nh_private_.param<double>("rush_weight_heading",  rush_weight_heading_,  3030.0);
@@ -139,7 +139,12 @@ void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
 void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
     if (msg->poses.empty()) return;
     og_x_ref_.clear(); og_y_ref_.clear(); theta_ref_.clear();
+    
+    // Reset progress index for new plan
+    path_progress_idx_ = 0;
+
     int skip = (msg->poses.size() <= 2 * (N_ + 5)) ? 1 : 2;
+
     for (size_t i = 0; i < msg->poses.size(); i += skip) {
         og_x_ref_.push_back(msg->poses[i].pose.position.x);
         og_y_ref_.push_back(msg->poses[i].pose.position.y);
@@ -256,12 +261,13 @@ void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
                                const std::vector<double>& y_ref,
                                double curr_x, double curr_y, int& min_idx) {
     double min_dist = std::numeric_limits<double>::max();
-    min_idx = 0;
-    for (size_t i = 0; i < x_ref.size(); ++i) {
+    min_idx = path_progress_idx_;
+    for (size_t i = path_progress_idx_; i < x_ref.size(); ++i) {
         double dx = x_ref[i]-curr_x, dy = y_ref[i]-curr_y;
         double d  = dx*dx + dy*dy;
-        if (d < min_dist) { min_dist = d; min_idx = static_cast<int>(i); }
+        if (d < min_dist) { min_dist = d; min_idx = (int)i; }
     }
+    path_progress_idx_ = min_idx;
 }
 
 std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
@@ -959,9 +965,24 @@ void MPCNode::run() {
         findClosestPoint(og_x_ref_, og_y_ref_, current_state_[0], current_state_[1], min_idx);
 
         x_ref_.clear(); y_ref_.clear();
-        for (size_t i = min_idx; i < og_x_ref_.size(); ++i) {
-            x_ref_.push_back(og_x_ref_[i]);
-            y_ref_.push_back(og_y_ref_[i]);
+         // this mean the reference points will be at least 20cm apart, which helps the solver converge better by not fighting over closely spaced references
+         // if reduced too much, the solver can struggle to find a feasible solution
+        const double min_spacing_sq = 0.1 * 0.1;
+
+        double last_x = og_x_ref_[min_idx];
+        double last_y = og_y_ref_[min_idx];
+        x_ref_.push_back(last_x);
+        y_ref_.push_back(last_y);
+
+        for (size_t i = min_idx + 1; i < og_x_ref_.size() && (int)x_ref_.size() <= N_ + 5; ++i) {
+            double dx = og_x_ref_[i] - last_x;
+            double dy = og_y_ref_[i] - last_y;
+            if ((dx*dx + dy*dy) >= min_spacing_sq) {
+                x_ref_.push_back(og_x_ref_[i]);
+                y_ref_.push_back(og_y_ref_[i]);
+                last_x = og_x_ref_[i];
+                last_y = og_y_ref_[i];
+            }
         }
         if (x_ref_.empty()) { publishVelocity(0.0, 0.0); return; }
 
