@@ -11,6 +11,7 @@
 #include <visualization_msgs/Marker.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <std_msgs/Float64MultiArray.h>
+#include <std_srvs/Empty.h>
 #include <obstacle_detector/Obstacles.h>
 #include <vector>
 #include <string>
@@ -45,18 +46,34 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
-// Priority: DYNAMIC_OBS > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
-// ROTATION_SHIM fires when a reversal is needed but the goal direction falls
-// inside the lidar blind zone — the robot spins in place until the goal is
-// visible, then hands off to normal reversal.
+// Priority (highest → lowest):
+//   DYNAMIC_OBS > RECOVERY > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
+//
+// RECOVERY fires when the robot is detected as stuck (position has not changed
+// by more than stuck_dist_threshold_ over stuck_timeout_ seconds while a
+// non-zero cmd_vel is being sent).  It then executes a finite sequence:
+//   ESCAPE_REVERSE  → drive backwards recovery_reverse_dist_ metres
+//   ESCAPE_ROTATE   → rotate in place by recovery_rotate_deg_
+//   ESCAPE_REPLAN   → stop and request a global replan via move_base
+//   (repeat up to recovery_max_attempts_ times)
+//   HARD_RESET      → stop and request a replan; if repeated replans fail,
+//                     the robot gives up and waits for a new goal.
 enum class ControlMode {
     NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
     STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
     DYNAMIC_OBS,     // Dynamic obstacles detected — full speed, higher accel weight
-    RUSH_GOAL,       // Near goal while static obs present — blast at v_linear_max_,
-                     // obstacles cleared from ACADOS params, heavy position weight
-    ROTATION_SHIM    // Reversal needed but goal in lidar blind spot — pure in-place
-                     // rotation until goal enters FOV, then releases to reversal
+    RUSH_GOAL,       // Near goal, no obstacles — blast at v_linear_max_
+    ROTATION_SHIM,   // Reversal needed but goal in lidar blind spot — spin in place
+    RECOVERY         // Robot is stuck — execute escape sequence then replan
+};
+
+// Sub-states of RECOVERY mode
+enum class RecoveryStep {
+    IDLE,            // Not in recovery
+    ESCAPE_REVERSE,  // Reversing away from obstacle
+    ESCAPE_ROTATE,   // Rotating 45° to find a new heading
+    ESCAPE_REPLAN,   // Waiting for move_base to deliver a new global plan
+    HARD_RESET       // Hard stop + replan after max attempts exhausted
 };
 
 class MPCNode {
@@ -83,6 +100,10 @@ private:
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     ros::Subscriber sub_dynamic_obstacle_;
+
+    // Service clients
+    ros::ServiceClient srv_clear_costmaps_;   // /move_base/clear_costmaps
+    ros::ServiceClient srv_make_plan_;        // (optional) not used directly
 
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
@@ -161,12 +182,26 @@ private:
     // =========================================================================
     // ROTATION_SHIM helpers
     // =========================================================================
-    // Returns true if the direction from robot to goal falls inside the lidar
-    // blind zone (a cone of half-angle lidar_blind_angle_deg_ centred on the
-    // robot's rear).
     bool isGoalInBlindSpot(double robot_theta,
                            double goal_x, double goal_y,
                            double robot_x, double robot_y) const;
+
+    // =========================================================================
+    // RECOVERY helpers
+    // =========================================================================
+    // Returns true if the robot is considered stuck.
+    // Condition: position has not changed by more than stuck_dist_threshold_
+    // within the last stuck_timeout_ seconds, AND we are commanding motion.
+    bool isRobotStuck() const;
+
+    // Tick the recovery FSM; sets v_opt_ / w_opt_ and returns the step taken.
+    // Returns true while recovery is still in progress, false once it should
+    // hand back to normal operation (new plan received after replan).
+    bool tickRecovery();
+
+    // Call move_base's clear_costmaps service and republish the current goal
+    // so the global planner generates a fresh plan.
+    void requestReplan();
 
     // =========================================================================
     // Robot constants (fixed)
@@ -190,10 +225,10 @@ private:
     // =========================================================================
 
     // --- Velocity limits ---
-    double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS & RUSH_GOAL
-    double v_static_obs_max_  = 0.9;   // [m/s] cap for STATIC_OBS
-    double omega_max_         = 1.8;   // [rad/s] shared limit
-    double omega_static_obs_max_ = 0.8; // [rad/s] cap for STATIC_OBS
+    double v_linear_max_      = 2.0;
+    double v_static_obs_max_  = 0.9;
+    double omega_max_         = 1.8;
+    double omega_static_obs_max_ = 0.8;
 
     // --- Stage cost weights ---
     double weight_position_error_ = 49.0;
@@ -230,17 +265,25 @@ private:
     bool   rush_goal_latched_   = false;
 
     // --- ROTATION_SHIM ---
-    // Half-angle (degrees) of the lidar blind zone centred on the robot rear.
-    // For a 270° FOV lidar the dead zone spans 90°, so half-angle = 45°.
     double lidar_blind_angle_deg_ = 45.0;
-    // Exit shim once the goal has moved this many degrees clear of the blind edge
-    // (set to 0 for no hysteresis, positive for a small angular buffer).
     double shim_exit_heading_deg_ = 30.0;
-    // Rotation speed commanded during ROTATION_SHIM [rad/s]
     double shim_omega_            = 1.2;
-    // Runtime state: whether shim is currently engaged and which way to turn
     bool   shim_active_     = false;
     bool   shim_turn_left_  = true;
+
+    // --- RECOVERY ---
+    // Stuck detection
+    double stuck_timeout_           = 3.0;   // [s]  time window to check for movement
+    double stuck_dist_threshold_    = 0.05;  // [m]  minimum displacement to be "moving"
+    double stuck_cmd_vel_threshold_ = 0.05;  // [m/s or rad/s] ignore if barely commanding
+
+    // Escape sequence parameters
+    double recovery_reverse_speed_  = 0.2;   // [m/s]   speed while reversing
+    double recovery_reverse_dist_   = 0.15;  // [m]     distance to reverse
+    double recovery_rotate_speed_   = 0.6;   // [rad/s] speed while rotating
+    double recovery_rotate_deg_     = 45.0;  // [deg]   angle to rotate
+    double recovery_replan_timeout_ = 5.0;   // [s]     wait for new plan before hard reset
+    int    recovery_max_attempts_   = 3;     // number of escape cycles before HARD_RESET
 
     // =========================================================================
     // Runtime state
@@ -254,7 +297,7 @@ private:
     std::vector<double> obs_x_, obs_y_;
     std::vector<double> map_x_, map_y_;
 
-    // Cached KD-tree for static obstacles (rebuilt on each cloud callback)
+    // Cached KD-tree for static obstacles
     pcl::PointCloud<pcl::PointXYZ>::Ptr static_obs_cloud_;
     pcl::KdTreeFLANN<pcl::PointXYZ>    static_obs_kdtree_;
     bool                                static_obs_kdtree_valid_ = false;
@@ -271,6 +314,19 @@ private:
     double w_opt_ = 0.0;
 
     std::vector<double> reverse_theta_ref_;
+
+    // --- RECOVERY runtime state ---
+    RecoveryStep recovery_step_        = RecoveryStep::IDLE;
+    int          recovery_attempt_     = 0;      // current attempt count
+    ros::Time    recovery_step_start_;           // when the current sub-step began
+    bool         recovery_rotate_left_ = true;   // direction chosen at entry
+    bool         recovery_new_plan_received_ = false; // set by callbackGlobalPlan
+
+    // Stuck detection sliding window
+    ros::Time    stuck_window_start_;            // start of the current check window
+    double       stuck_window_start_x_ = 0.0;
+    double       stuck_window_start_y_ = 0.0;
+    bool         stuck_window_init_    = false;
 };
 
 } // namespace mpc_controller
