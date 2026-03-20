@@ -1,0 +1,30 @@
+teamrobo2026:
+  position_weight_mult_dynamic: 0.7000000000000001
+  heading_weight_mult_dynamic: 0.44999999999999996
+  accel_weight_mult_dynamic: 4.9711669468300554
+  vel_weight_mult_dynamic: 1.113057650495854
+
+  weight_position_error: 128.0
+  weight_heading_error: 57.0
+  weight_velocity: 33.0
+  weight_acceleration: 0.01803665193219243
+
+  min_spacing_global_plan: 0.14
+
+  v_static_obs_max: 1.0
+  omega_static_obs_max: 1.0
+
+  dynamic_obs_safe_dist: 8.8
+  dynamic_obs_timeout: 0.35
+
+  rush_goal_dist: 4.6
+  rush_goal_exit_dist: 0.8
+
+  reversal_threshold: 0.9
+  reversal_angle_deg: 85.0
+
+  lidar_blind_angle_deg: 39.0
+  shim_exit_heading_deg: 15.0
+  shim_omega: 0.8
+
+  obs_search_radius: 5.0

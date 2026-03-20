@@ -191,36 +191,39 @@ private:
 
     // --- Velocity limits ---
     double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS & RUSH_GOAL
-    double v_static_obs_max_  = 0.9;   // [m/s] cap for STATIC_OBS
+    double v_static_obs_max_  = 1.0;   // [m/s] cap for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
-    double omega_static_obs_max_ = 0.8; // [rad/s] cap for STATIC_OBS
+    double omega_static_obs_max_ = 1.0; // [rad/s] cap for STATIC_OBS
 
     // --- Stage cost weights ---
-    double weight_position_error_ = 49.0;
-    double weight_heading_error_  = 37.0;
-    double weight_acceleration_   = 0.0021;
-    double weight_velocity_       = 10.0;
+    double weight_position_error_ = 128.0;
+    double weight_heading_error_  = 57.0;
+    double weight_acceleration_   = 0.01803665193219243;
+    double weight_velocity_       = 33.0;
 
     double accel_weight_mult_static_  = 5.0;
-    double accel_weight_mult_dynamic_ = 3.0;
+    double accel_weight_mult_dynamic_ = 4.9711669468300554;
+    double position_weight_mult_dynamic_ = 0.7000000000000001;
+    double heading_weight_mult_dynamic_  = 0.44999999999999996;
+    double vel_weight_mult_dynamic_      = 1.113057650495854;
 
     // --- Mode trigger distances ---
     double static_obs_safe_dist_   = 1.25;
-    double dynamic_obs_safe_dist_  = 2.5;
+    double dynamic_obs_safe_dist_  = 8.8;
 
     // --- Obstacle geometry ---
     double robot_radius_       = 0.35;
     double dynamic_obs_radius_ = 0.5;
     double safety_margin_      = 0.1;
-    double obs_search_radius_  = 4.0;
+    double obs_search_radius_  = 5.0;
 
     // --- Reversal detection ---
-    double reversal_threshold_ = 0.7;
-    double reversal_angle_deg_ = 90.0;
+    double reversal_threshold_ = 0.9;
+    double reversal_angle_deg_ = 85.0;
 
     // --- RUSH_GOAL ---
-    double rush_goal_dist_      = 4.0;
-    double rush_goal_exit_dist_ = 0.5;
+    double rush_goal_dist_      = 4.6;
+    double rush_goal_exit_dist_ = 0.8;
     double rush_weight_position_   = 5000.0;
     double rush_weight_heading_    = 6000.0;
     double rush_weight_velocity_   = 50000.0;
@@ -232,12 +235,12 @@ private:
     // --- ROTATION_SHIM ---
     // Half-angle (degrees) of the lidar blind zone centred on the robot rear.
     // For a 270° FOV lidar the dead zone spans 90°, so half-angle = 45°.
-    double lidar_blind_angle_deg_ = 45.0;
+    double lidar_blind_angle_deg_ = 39.0;
     // Exit shim once the goal has moved this many degrees clear of the blind edge
     // (set to 0 for no hysteresis, positive for a small angular buffer).
-    double shim_exit_heading_deg_ = 30.0;
+    double shim_exit_heading_deg_ = 15.0;
     // Rotation speed commanded during ROTATION_SHIM [rad/s]
-    double shim_omega_            = 1.2;
+    double shim_omega_            = 0.8;
     // Runtime state: whether shim is currently engaged and which way to turn
     bool   shim_active_     = false;
     bool   shim_turn_left_  = true;
@@ -261,7 +264,10 @@ private:
     void rebuildStaticKdtree();
 
     ros::Time last_dynamic_obs_time_;
-    double dynamic_obs_timeout_ = 0.5;
+    double dynamic_obs_timeout_ = 0.35;
+
+    // Minimum spacing (meters) when subsampling the global plan for MPC refs.
+    double min_spacing_global_plan_ = 0.14;
 
     ControlMode mode_        = ControlMode::NORMAL;
     bool        in_reversal_ = false;

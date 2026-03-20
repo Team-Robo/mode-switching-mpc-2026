@@ -40,5 +40,6 @@
     </node>
 	<node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud"></node>
     <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud"></node>
+    <rosparam file="$(find teamrobo2026)/configs/teamrobo2026_mpc_params.yaml" command="load" />
     <node pkg="teamrobo2026" type="mpc_node" name="teamrobo2026" output="screen"></node>
 </launch>

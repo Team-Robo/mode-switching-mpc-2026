@@ -15,37 +15,40 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private)
 {
     nh_private_.param<double>("v_linear_max",      v_linear_max_,      2.0);
-    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  0.5);
+    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  1.0);
     nh_private_.param<double>("omega_max",          omega_max_,         1.8);
-    nh_private_.param<double>("omega_static_obs_max", omega_static_obs_max_, 0.8);
+    nh_private_.param<double>("omega_static_obs_max", omega_static_obs_max_, 1.0);
 
-    nh_private_.param<double>("weight_position_error",  weight_position_error_,  130.0);
-    nh_private_.param<double>("weight_heading_error",   weight_heading_error_,   49.0);
-    nh_private_.param<double>("weight_velocity",        weight_velocity_,        27.0);
-    nh_private_.param<double>("weight_acceleration",    weight_acceleration_,    0.0011130334330777412);
+    nh_private_.param<double>("weight_position_error",  weight_position_error_,  128.0);
+    nh_private_.param<double>("weight_heading_error",   weight_heading_error_,   57.0);
+    nh_private_.param<double>("weight_velocity",        weight_velocity_,        33.0);
+    nh_private_.param<double>("weight_acceleration",    weight_acceleration_,    0.01803665193219243);
 
     nh_private_.param<double>("accel_weight_mult_static",   accel_weight_mult_static_,  3.0);
-    nh_private_.param<double>("accel_weight_mult_dynamic",  accel_weight_mult_dynamic_, 5.5);
+    nh_private_.param<double>("accel_weight_mult_dynamic",  accel_weight_mult_dynamic_, 4.9711669468300554);
+    nh_private_.param<double>("position_weight_mult_dynamic", position_weight_mult_dynamic_, 0.7000000000000001);
+    nh_private_.param<double>("heading_weight_mult_dynamic",  heading_weight_mult_dynamic_,  0.44999999999999996);
+    nh_private_.param<double>("vel_weight_mult_dynamic",      vel_weight_mult_dynamic_,      1.113057650495854);
 
     nh_private_.param<double>("static_obs_safe_dist",  static_obs_safe_dist_,  1.1);
-    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 4.0);
+    nh_private_.param<double>("dynamic_obs_safe_dist", dynamic_obs_safe_dist_, 8.8);
 
     nh_private_.param<double>("robot_radius",       robot_radius_,       0.37);
     nh_private_.param<double>("dynamic_obs_radius", dynamic_obs_radius_, 0.5);
     nh_private_.param<double>("safety_margin",      safety_margin_,      0.01);
-    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  4.0);
+    nh_private_.param<double>("obs_search_radius",  obs_search_radius_,  5.0);
 
-    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.85);
-    nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 90.0);
+    nh_private_.param<double>("reversal_threshold", reversal_threshold_, 0.9);
+    nh_private_.param<double>("reversal_angle_deg", reversal_angle_deg_, 85.0);
 
     // ROTATION_SHIM params
-    nh_private_.param<double>("lidar_blind_angle_deg", lidar_blind_angle_deg_, 45.0);
-    nh_private_.param<double>("shim_exit_heading_deg", shim_exit_heading_deg_, 30.0);
-    nh_private_.param<double>("shim_omega",             shim_omega_,            1.2);
+    nh_private_.param<double>("lidar_blind_angle_deg", lidar_blind_angle_deg_, 39.0);
+    nh_private_.param<double>("shim_exit_heading_deg", shim_exit_heading_deg_, 15.0);
+    nh_private_.param<double>("shim_omega",             shim_omega_,            0.8);
 
     // RUSH_GOAL params — direct absolute weights, no multipliers
-    nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.3);
-    nh_private_.param<double>("rush_goal_exit_dist",  rush_goal_exit_dist_,  0.0);
+    nh_private_.param<double>("rush_goal_dist",       rush_goal_dist_,       4.6);
+    nh_private_.param<double>("rush_goal_exit_dist",  rush_goal_exit_dist_,  0.8);
     nh_private_.param<double>("rush_weight_position", rush_weight_position_, 0.0);
     nh_private_.param<double>("rush_weight_heading",  rush_weight_heading_,  3030.0);
     nh_private_.param<double>("rush_weight_velocity", rush_weight_velocity_, 3050.0);
@@ -53,7 +56,9 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
 
     // Dynamic obstacle hysteresis timeout
-    nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.2);
+    nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.35);
+
+    nh_private_.param<double>("min_spacing_global_plan", min_spacing_global_plan_, 0.14);
 
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
@@ -62,6 +67,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              weight_position_error_, weight_heading_error_, weight_acceleration_, weight_velocity_);
     ROS_INFO("  Accel mults: static=%.1f  dynamic=%.1f",
              accel_weight_mult_static_, accel_weight_mult_dynamic_);
+    ROS_INFO("  Dynamic weight mults: pos=%.3f  heading=%.3f  vel=%.3f",
+             position_weight_mult_dynamic_, heading_weight_mult_dynamic_, vel_weight_mult_dynamic_);
     ROS_INFO("  Trigger dists: static=%.2f m  dynamic=%.2f m",
              static_obs_safe_dist_, dynamic_obs_safe_dist_);
     ROS_INFO("  Reversal: threshold=%.2f  angle=%.1f deg",
@@ -72,6 +79,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              rush_goal_dist_, rush_weight_position_, rush_weight_heading_,
              rush_weight_velocity_, rush_weight_accel_, rush_vref_);
     ROS_INFO("  Dynamic obs hysteresis timeout: %.2f s", dynamic_obs_timeout_);
+    ROS_INFO("  Global plan min spacing: %.2f m", min_spacing_global_plan_);
 
     pub_vel_      = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
@@ -689,9 +697,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
             v_cap                  = v_linear_max_;
             omega_cap              = omega_max_;
             effective_accel_weight = weight_acceleration_ * accel_weight_mult_dynamic_;
-            eff_pos_weight         = weight_position_error_;
-            eff_heading_weight     = weight_heading_error_;
-            eff_velocity_weight    = weight_velocity_;
+            eff_pos_weight         = weight_position_error_ * position_weight_mult_dynamic_;
+            eff_heading_weight     = weight_heading_error_ * heading_weight_mult_dynamic_;
+            eff_velocity_weight    = weight_velocity_ * vel_weight_mult_dynamic_;
             break;
 
         default: // NORMAL
@@ -962,7 +970,8 @@ void MPCNode::run() {
          // this mean the reference points will be at least 20cm apart, which helps the solver converge better by not fighting over closely spaced references
          // if reduced too much, the solver can struggle to find a feasible solution
         // gap between reference points
-        const double min_spacing_sq = 0.1 * 0.1;
+        const double min_spacing = std::max(0.0, min_spacing_global_plan_);
+        const double min_spacing_sq = min_spacing * min_spacing;
 
         double last_x = og_x_ref_[min_idx];
         double last_y = og_y_ref_[min_idx];
