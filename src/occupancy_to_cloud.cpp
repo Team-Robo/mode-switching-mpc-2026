@@ -21,6 +21,9 @@ private:
     uint32_t last_map_seq_ = 0;
     bool map_updated_ = false;
 
+    bool bench_log_enabled_ = true;
+    double bench_log_period_s_ = 1.0;
+
     ros::Subscriber sub_map;
     ros::Publisher pub_point_cloud;
     tf::TransformListener tf_listener;
@@ -30,9 +33,16 @@ public:
         sub_map = nh.subscribe(TOPIC_LOCAL_MAP, 1, &OccupancyToCloud::callbackMap, this);
         pub_point_cloud = nh.advertise<sensor_msgs::PointCloud2>(TOPIC_MAP_CLOUD, 1);
         map_origin.resize(2);
+
+        ros::NodeHandle nh_private("~");
+        nh_private.param<bool>("bench_log_enabled", bench_log_enabled_, true);
+        nh_private.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+        ROS_INFO("[OccupancyToCloud] bench logging: enabled=%s period=%.2fs",
+                 bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
     }
 
     void callbackMap(const nav_msgs::OccupancyGrid::ConstPtr& msg) {
+        const auto t_cb_start = ros::WallTime::now();
         if (msg->header.seq == last_map_seq_) return;
         last_map_seq_ = msg->header.seq;
         map_updated_  = true;
@@ -46,17 +56,29 @@ public:
         int map_width  = msg->info.width;
         int map_height = msg->info.height;
 
+        const auto t_before_grid = ros::WallTime::now();
+
         // Reshape flat data into column-major 2-D grid
         map_grid.assign(map_width, std::vector<int8_t>(map_height));
         for (int i = 0; i < map_width; ++i)
             for (int j = 0; j < map_height; ++j)
                 map_grid[i][j] = msg->data[j * map_width + i];
 
+        const auto t_after_grid = ros::WallTime::now();
+
         map_origin[0] = map_Ox;
         map_origin[1] = map_Oy;
 
         ROS_INFO_THROTTLE(2.0, "Map updated: %d x %d, res=%.3f, origin=(%.2f, %.2f)",
                           map_width, map_height, map_res, map_Ox, map_Oy);
+        if (bench_log_enabled_) {
+            const auto t_cb_end = ros::WallTime::now();
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][occupancy_to_cloud][callbackMap] total="
+                << (t_cb_end - t_cb_start).toSec() * 1e3 << " ms"
+                << " | reshape_grid=" << (t_after_grid - t_before_grid).toSec() * 1e3 << " ms"
+                << " | size=" << map_width << "x" << map_height);
+        }
     }
 
     double boundedAngle(double angle) {
@@ -67,9 +89,16 @@ public:
     }
 
     void run() {
+        const auto t_start = ros::WallTime::now();
         if (map_grid.empty()) return;
         if (!map_updated_) return;
         map_updated_ = false;
+
+        ros::WallTime t_after_tf = t_start;
+        ros::WallTime t_after_bbox = t_start;
+        ros::WallTime t_after_bin_loop = t_start;
+        ros::WallTime t_after_count = t_start;
+        ros::WallTime t_after_pack = t_start;
 
         tf::StampedTransform transform;
         try {
@@ -78,6 +107,7 @@ public:
             ROS_WARN_THROTTLE(1.0, "TF lookup failed: %s", ex.what());
             return;
         }
+        t_after_tf = ros::WallTime::now();
 
         double tx  = transform.getOrigin().x();
         double ty  = transform.getOrigin().y();
@@ -104,6 +134,7 @@ public:
         itly = std::max(0, std::min(itly, H - 1));
         ibrx = std::max(0, std::min(ibrx, W - 1));
         ibry = std::max(0, std::min(ibry, H - 1));
+        t_after_bbox = ros::WallTime::now();
 
         // -----------------------------------------------------------------------
         // Angle bins
@@ -169,6 +200,7 @@ public:
                 };
             }
         }
+        t_after_bin_loop = ros::WallTime::now();
 
         // -----------------------------------------------------------------------
         // Build PointCloud2
@@ -183,6 +215,7 @@ public:
         int valid_count = 0;
         for (int i = 0; i < num_angles; ++i)
             if (points_dist[i] != std::numeric_limits<double>::infinity()) ++valid_count;
+        t_after_count = ros::WallTime::now();
 
         sensor_msgs::PointCloud2Modifier modifier(pointcloud);
         modifier.setPointCloud2Fields(4,
@@ -206,9 +239,24 @@ public:
             *out_i = 1.0f;
             ++out_x; ++out_y; ++out_z; ++out_i;
         }
+        t_after_pack = ros::WallTime::now();
 
         pub_point_cloud.publish(pointcloud);
         ROS_INFO_THROTTLE(2.0, "Published %d map-cloud points", valid_count);
+
+        if (bench_log_enabled_) {
+            const auto t_end = ros::WallTime::now();
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][occupancy_to_cloud][run] total=" << (t_end - t_start).toSec() * 1e3 << " ms"
+                << " | tf_lookup=" << (t_after_tf - t_start).toSec() * 1e3 << " ms"
+                << " | bbox_indexing=" << (t_after_bbox - t_after_tf).toSec() * 1e3 << " ms"
+                << " | obstacle_bin_loop=" << (t_after_bin_loop - t_after_bbox).toSec() * 1e3 << " ms"
+                << " | valid_bin_count=" << (t_after_count - t_after_bin_loop).toSec() * 1e3 << " ms"
+                << " | pack_cloud=" << (t_after_pack - t_after_count).toSec() * 1e3 << " ms"
+                << " | publish=" << (t_end - t_after_pack).toSec() * 1e3 << " ms"
+                << " | bins=" << num_angles
+                << " | valid=" << valid_count);
+        }
     }
 };
 

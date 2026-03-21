@@ -117,7 +117,7 @@ private:
 
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
-    double headingPreprocess(double center, double target);
+    double headingPreprocess(double center, double target) const;
     double diffAngle(double a1, double a2) const;
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
@@ -134,6 +134,19 @@ private:
     std::vector<PredictedObstacle> predicted_obstacles_;
     std::vector<PredictedObstacle> predictObstaclesTrajectory(
         const std::vector<DynamicObstacle>& obstacles, double dt, int N);
+
+    // Dynamic behavior planning: locally deform reference path to route around
+    // predicted moving obstacles before passing references to ACADOS.
+    void applyDynamicBehaviorPlanning(
+        std::vector<double>& x_ref,
+        std::vector<double>& y_ref,
+        const std::vector<PredictedObstacle>& predicted_obstacles,
+        const std::vector<double>& current_state,
+        double dt) const;
+    std::vector<double> buildHeadingRefFromPath(
+        const std::vector<double>& x_ref,
+        const std::vector<double>& y_ref,
+        double current_heading) const;
 
     // =========================================================================
     // Obstacle selection — 2 closest static + up to 10 dynamic (24 params)
@@ -157,6 +170,7 @@ private:
     // =========================================================================
     double distToGoal(double rx, double ry) const;
     void warmStartFromCurrentState(const std::vector<double>& current_state);
+    void clampWarmSolutionToVcap(double v_cap, double omega_cap);
 
     // =========================================================================
     // ROTATION_SHIM helpers
@@ -266,10 +280,21 @@ private:
     ros::Time last_dynamic_obs_time_;
     double dynamic_obs_timeout_ = 0.35;
 
+    // Dynamic behavior-planning knobs
+    double dyn_plan_influence_dist_ = 3.5;
+    double dyn_plan_margin_ = 0.25;
+    double dyn_plan_max_lateral_shift_ = 1.2;
+    double dyn_plan_smoothing_ = 0.35;
+
     // Minimum spacing (meters) when subsampling the global plan for MPC refs.
     double min_spacing_global_plan_ = 0.14;
 
+    // Benchmark logging controls
+    bool   bench_log_enabled_   = true;
+    double bench_log_period_s_  = 1.0;
+
     ControlMode mode_        = ControlMode::NORMAL;
+    ControlMode prev_mode_   = ControlMode::NORMAL;
     bool        in_reversal_ = false;
     std::string display_text_;
 

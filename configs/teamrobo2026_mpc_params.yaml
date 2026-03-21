@@ -4,20 +4,26 @@ teamrobo2026:
   accel_weight_mult_dynamic: 4.9711669468300554
   vel_weight_mult_dynamic: 1.113057650495854
 
-  weight_position_error: 128.0
-  weight_heading_error: 57.0
-  weight_velocity: 33.0
-  weight_acceleration: 0.01803665193219243
+  weight_position_error: 130.0
+  weight_heading_error: 60.0
+  weight_velocity: 27.0
+  weight_acceleration: 0.0011130334330777412
+  static_obs_safe_dist: 1.2
 
-  min_spacing_global_plan: 0.14
+  min_spacing_global_plan: 0.10
 
-  v_static_obs_max: 1.0
+  v_static_obs_max: 0.765
   omega_static_obs_max: 1.0
 
   dynamic_obs_safe_dist: 8.8
   dynamic_obs_timeout: 0.35
 
-  rush_goal_dist: 4.6
+  dyn_plan_influence_dist: 4.0
+  dyn_plan_margin: 0.25
+  dyn_plan_max_lateral_shift: 1.2
+  dyn_plan_smoothing: 0.35
+
+  rush_goal_dist: 4.0
   rush_goal_exit_dist: 0.8
 
   reversal_threshold: 0.9
@@ -28,3 +34,14 @@ teamrobo2026:
   shim_omega: 0.8
 
   obs_search_radius: 5.0
+
+  bench_log_enabled: false
+  bench_log_period_s: 1.0
+
+laser_scan_to_point_cloud:
+  bench_log_enabled: false
+  bench_log_period_s: 1.0
+
+map_to_cloud:
+  bench_log_enabled: false
+  bench_log_period_s: 1.0

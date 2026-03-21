@@ -11,6 +11,19 @@
 
 namespace mpc_controller {
 
+namespace {
+inline void normalize2D(double& x, double& y) {
+    const double n = std::sqrt(x * x + y * y);
+    if (n > 1e-9) {
+        x /= n;
+        y /= n;
+    } else {
+        x = 1.0;
+        y = 0.0;
+    }
+}
+}  // namespace
+
 MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private)
 {
@@ -58,7 +71,15 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     // Dynamic obstacle hysteresis timeout
     nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.35);
 
+    // Dynamic behavior-planning knobs
+    nh_private_.param<double>("dyn_plan_influence_dist", dyn_plan_influence_dist_, 3.5);
+    nh_private_.param<double>("dyn_plan_margin", dyn_plan_margin_, 0.25);
+    nh_private_.param<double>("dyn_plan_max_lateral_shift", dyn_plan_max_lateral_shift_, 1.2);
+    nh_private_.param<double>("dyn_plan_smoothing", dyn_plan_smoothing_, 0.35);
+
     nh_private_.param<double>("min_spacing_global_plan", min_spacing_global_plan_, 0.14);
+    nh_private_.param<bool>("bench_log_enabled", bench_log_enabled_, true);
+    nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
 
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
@@ -79,7 +100,11 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              rush_goal_dist_, rush_weight_position_, rush_weight_heading_,
              rush_weight_velocity_, rush_weight_accel_, rush_vref_);
     ROS_INFO("  Dynamic obs hysteresis timeout: %.2f s", dynamic_obs_timeout_);
+    ROS_INFO("  Dynamic behavior plan: influence=%.2f m  margin=%.2f m  max_shift=%.2f m  smooth=%.2f",
+             dyn_plan_influence_dist_, dyn_plan_margin_, dyn_plan_max_lateral_shift_, dyn_plan_smoothing_);
     ROS_INFO("  Global plan min spacing: %.2f m", min_spacing_global_plan_);
+    ROS_INFO("  Bench logging: enabled=%s  period=%.2f s",
+             bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
 
     pub_vel_      = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
@@ -204,7 +229,7 @@ double MPCNode::quaternionToYaw(const geometry_msgs::Quaternion& q) {
     return std::atan2(2.0*(q.z*q.w + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z));
 }
 
-double MPCNode::headingPreprocess(double center, double target) {
+double MPCNode::headingPreprocess(double center, double target) const {
     while (target < center - M_PI) target += 2.0 * M_PI;
     while (target > center + M_PI) target -= 2.0 * M_PI;
     return target;
@@ -296,6 +321,134 @@ std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
         preds.push_back(pred);
     }
     return preds;
+}
+
+void MPCNode::applyDynamicBehaviorPlanning(
+    std::vector<double>& x_ref,
+    std::vector<double>& y_ref,
+    const std::vector<PredictedObstacle>& predicted_obstacles,
+    const std::vector<double>& current_state,
+    double dt) const
+{
+    (void)dt;
+    if (x_ref.size() < 3 || y_ref.size() < 3 || predicted_obstacles.empty()) {
+        return;
+    }
+
+    const size_t horizon_pts = std::min(static_cast<size_t>(N_ + 1), x_ref.size());
+    const double influence = std::max(dyn_plan_influence_dist_, 0.1);
+    const double max_shift = std::max(dyn_plan_max_lateral_shift_, 0.0);
+    const double smoothing = std::min(0.9, std::max(0.0, dyn_plan_smoothing_));
+
+    std::vector<double> shifted_x = x_ref;
+    std::vector<double> shifted_y = y_ref;
+
+    for (size_t i = 0; i < horizon_pts; ++i) {
+        double tx, ty;
+        if (i + 1 < x_ref.size()) {
+            tx = x_ref[i + 1] - x_ref[i];
+            ty = y_ref[i + 1] - y_ref[i];
+        } else {
+            tx = x_ref[i] - x_ref[i - 1];
+            ty = y_ref[i] - y_ref[i - 1];
+        }
+        normalize2D(tx, ty);
+        const double nx = -ty;
+        const double ny = tx;
+
+        double lateral_shift = 0.0;
+        for (const auto& pred : predicted_obstacles) {
+            if (i >= pred.x_predicted.size() || i >= pred.y_predicted.size() || i >= pred.radius_predicted.size()) {
+                continue;
+            }
+
+            const double ox = pred.x_predicted[i];
+            const double oy = pred.y_predicted[i];
+            const double dx = ox - x_ref[i];
+            const double dy = oy - y_ref[i];
+            const double dist = std::sqrt(dx * dx + dy * dy);
+
+            const double hard_clear = robot_radius_ + pred.radius_predicted[i] + safety_margin_ + dyn_plan_margin_;
+            if (dist >= influence) {
+                continue;
+            }
+
+            const double denom = std::max(1e-3, influence - hard_clear);
+            const double strength = std::min(1.0, std::max(0.0, (influence - dist) / denom));
+            if (strength <= 0.0) {
+                continue;
+            }
+
+            const double side = dx * nx + dy * ny;
+            double sign = 0.0;
+            if (std::fabs(side) > 1e-3) {
+                sign = (side > 0.0) ? -1.0 : 1.0;
+            } else {
+                const double robot_side = (current_state[0] - x_ref[i]) * nx +
+                                          (current_state[1] - y_ref[i]) * ny;
+                sign = (robot_side >= 0.0) ? -1.0 : 1.0;
+            }
+
+            lateral_shift += sign * strength * 0.8;
+        }
+
+        lateral_shift = std::max(-max_shift, std::min(max_shift, lateral_shift));
+        shifted_x[i] = x_ref[i] + nx * lateral_shift;
+        shifted_y[i] = y_ref[i] + ny * lateral_shift;
+    }
+
+    // Keep the tail fixed at the nominal goal to preserve terminal convergence.
+    const size_t tail_keep = std::min(static_cast<size_t>(3), horizon_pts);
+    for (size_t i = 0; i < tail_keep; ++i) {
+        const size_t idx = horizon_pts - 1 - i;
+        shifted_x[idx] = x_ref[idx];
+        shifted_y[idx] = y_ref[idx];
+    }
+
+    // One-pass smoothing to avoid zig-zag references.
+    if (smoothing > 0.0 && horizon_pts > 2) {
+        std::vector<double> smooth_x = shifted_x;
+        std::vector<double> smooth_y = shifted_y;
+        for (size_t i = 1; i + 1 < horizon_pts; ++i) {
+            const double lap_x = 0.25 * shifted_x[i - 1] + 0.5 * shifted_x[i] + 0.25 * shifted_x[i + 1];
+            const double lap_y = 0.25 * shifted_y[i - 1] + 0.5 * shifted_y[i] + 0.25 * shifted_y[i + 1];
+            smooth_x[i] = (1.0 - smoothing) * shifted_x[i] + smoothing * lap_x;
+            smooth_y[i] = (1.0 - smoothing) * shifted_y[i] + smoothing * lap_y;
+        }
+        shifted_x.swap(smooth_x);
+        shifted_y.swap(smooth_y);
+    }
+
+    x_ref.swap(shifted_x);
+    y_ref.swap(shifted_y);
+}
+
+std::vector<double> MPCNode::buildHeadingRefFromPath(
+    const std::vector<double>& x_ref,
+    const std::vector<double>& y_ref,
+    double current_heading) const
+{
+    std::vector<double> theta_ref;
+    if (x_ref.empty() || y_ref.empty()) {
+        return theta_ref;
+    }
+
+    theta_ref.reserve(x_ref.size());
+    double center = current_heading;
+    if (x_ref.size() == 1) {
+        theta_ref.push_back(center);
+        return theta_ref;
+    }
+
+    for (size_t i = 0; i + 1 < x_ref.size(); ++i) {
+        const double dx = x_ref[i + 1] - x_ref[i];
+        const double dy = y_ref[i + 1] - y_ref[i];
+        const double th = headingPreprocess(center, std::atan2(dy, dx));
+        theta_ref.push_back(th);
+        center = th;
+    }
+    theta_ref.push_back(theta_ref.back());
+    return theta_ref;
 }
 
 // =============================================================================
@@ -452,7 +605,15 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& obs_y
                     )
 {
-    auto t0 = ros::WallTime::now();
+    const auto t_start = ros::WallTime::now();
+    ros::WallTime t_after_init = t_start;
+    ros::WallTime t_after_predict = t_start;
+    ros::WallTime t_after_mode = t_start;
+    ros::WallTime t_after_warmstart = t_start;
+    ros::WallTime t_after_constraints = t_start;
+    ros::WallTime t_after_cost = t_start;
+    ros::WallTime t_after_params = t_start;
+    ros::WallTime t_after_solve = t_start;
 
     // =========================================================================
     // 1. INITIAL STATE CONSTRAINT
@@ -461,6 +622,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                                   "lbx", (void*)current_state.data());
     ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
                                   "ubx", (void*)current_state.data());
+    t_after_init = ros::WallTime::now();
 
     // =========================================================================
     // 2. PREDICT DYNAMIC OBSTACLES
@@ -468,11 +630,22 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     constexpr double Tf = 2.0;
     double dt = Tf / N_;
     predicted_obstacles_ = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
+    t_after_predict = ros::WallTime::now();
 
     // =========================================================================
     // 3. EMERGENCY STOP CHECK
     // =========================================================================
     if (checkEmergencyStop(predicted_obstacles_, current_state)) {
+        if (bench_log_enabled_) {
+            const double total_ms = (ros::WallTime::now() - t_start).toSec() * 1e3;
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][solveOCP] early-exit(emergency_stop) total="
+                << total_ms << " ms"
+                << " | init_state=" << (t_after_init - t_start).toSec() * 1e3
+                << " ms"
+                << " | predict_dyn=" << (t_after_predict - t_after_init).toSec() * 1e3
+                << " ms");
+        }
         return false;
     }
 
@@ -525,11 +698,12 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     if (dynamic_obs_active) {
         rush_goal_latched_ = false;
+    } else if (has_static_obs) {
+        rush_goal_latched_ = false;  // let STATIC_OBS take over
     } else if (trigger_rush) {
         rush_goal_latched_ = true;
     } else if (rush_goal_latched_ && goal_dist < rush_goal_exit_dist_) {
         rush_goal_latched_ = false;
-        ROS_INFO("RUSH_GOAL: goal reached, releasing latch (dist=%.2fm)", goal_dist);
     }
 
     // --- Primary mode assignment (priority order) ---
@@ -627,6 +801,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         // once the dynamic obstacle clears.
         shim_active_ = false;
     }
+    t_after_mode = ros::WallTime::now();
 
     // =========================================================================
     // 4c. ROTATION_SHIM EARLY-EXIT — bypass the ACADOS solver completely.
@@ -641,8 +816,18 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     if (mode_ == ControlMode::ROTATION_SHIM) {
         v_opt_ = 0.0;
         w_opt_ = shim_turn_left_ ? shim_omega_ : -shim_omega_;
-        const double ms_shim = (ros::WallTime::now() - t0).toSec() * 1e3;
-        ROS_INFO_STREAM_THROTTLE(1.0, "[BENCH] ROTATION_SHIM early-exit = " << ms_shim << " ms");
+        if (bench_log_enabled_) {
+            const double total_ms = (ros::WallTime::now() - t_start).toSec() * 1e3;
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][solveOCP] early-exit(rotation_shim) total="
+                << total_ms << " ms"
+                << " | init_state=" << (t_after_init - t_start).toSec() * 1e3
+                << " ms"
+                << " | predict_dyn=" << (t_after_predict - t_after_init).toSec() * 1e3
+                << " ms"
+                << " | mode_detection=" << (t_after_mode - t_after_predict).toSec() * 1e3
+                << " ms");
+        }
         return true;
     }
 
@@ -654,6 +839,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         warmStartFromCurrentState(current_state);
     }
     prev_was_rush_goal_ = (mode_ == ControlMode::RUSH_GOAL);
+    t_after_warmstart = ros::WallTime::now();
 
     // =========================================================================
     // 6. MODE-SPECIFIC CONFIG
@@ -747,6 +933,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
         ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
     }
+    t_after_constraints = ros::WallTime::now();
 
     // =========================================================================
     // 9. COST WEIGHTS
@@ -778,6 +965,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         }
         ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "W", W_e.data());
     }
+    t_after_cost = ros::WallTime::now();
 
     // =========================================================================
     // 10. PER-STAGE: REFERENCE & OBSTACLE PARAMETERS
@@ -863,6 +1051,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
         jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 24);
     }
+    t_after_params = ros::WallTime::now();
 
     // =========================================================================
     // 11. SOLVE
@@ -872,6 +1061,7 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_WARN("ACADOS solver failed with status %d", status);
         return false;
     }
+    t_after_solve = ros::WallTime::now();
 
     // =========================================================================
     // 12. EXTRACT SOLUTION
@@ -888,9 +1078,20 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         x_traj.push_back(xs[0]); y_traj.push_back(xs[1]);
     }
     publishTrajectory(x_traj, y_traj);
-    const double ms = (ros::WallTime::now() - t0).toSec() * 1e3;
-    ROS_INFO_STREAM_THROTTLE(1.0,
-        "[BENCH] solveOCP wall-time = " << ms << " ms");
+    if (bench_log_enabled_) {
+        const auto t_end = ros::WallTime::now();
+        ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+            "[BENCH][solveOCP] total=" << (t_end - t_start).toSec() * 1e3 << " ms"
+            << " | init_state="      << (t_after_init - t_start).toSec() * 1e3 << " ms"
+            << " | predict_dyn="      << (t_after_predict - t_after_init).toSec() * 1e3 << " ms"
+            << " | mode_detection="   << (t_after_mode - t_after_predict).toSec() * 1e3 << " ms"
+            << " | warmstart="        << (t_after_warmstart - t_after_mode).toSec() * 1e3 << " ms"
+            << " | constraints="      << (t_after_constraints - t_after_warmstart).toSec() * 1e3 << " ms"
+            << " | costs="            << (t_after_cost - t_after_constraints).toSec() * 1e3 << " ms"
+            << " | stage_params="     << (t_after_params - t_after_cost).toSec() * 1e3 << " ms"
+            << " | acados_solve="     << (t_after_solve - t_after_params).toSec() * 1e3 << " ms"
+            << " | extract_publish="  << (t_end - t_after_solve).toSec() * 1e3 << " ms");
+    }
     return true;
 }
 
@@ -961,6 +1162,11 @@ void MPCNode::publishMarker() {
 void MPCNode::run() {
     std::lock_guard<std::mutex> lock(solver_mutex_);
     try {
+        const auto t_run_start = ros::WallTime::now();
+        ros::WallTime t_after_refs = t_run_start;
+        ros::WallTime t_after_theta_obs = t_run_start;
+        ros::WallTime t_after_solve = t_run_start;
+
         if (og_x_ref_.empty() || theta_ref_.empty()) return;
 
         int min_idx = 0;
@@ -994,21 +1200,32 @@ void MPCNode::run() {
         while (x_ref_.size() <= static_cast<size_t>(N_)) {
             x_ref_.push_back(gx); y_ref_.push_back(gy);
         }
+        t_after_refs = ros::WallTime::now();
 
-        std::vector<double> theta_sub;
-        for (size_t i = min_idx; i < theta_ref_.size(); ++i)
-            theta_sub.push_back(theta_ref_[i]);
-        while (theta_sub.size() < x_ref_.size())
+        constexpr double Tf = 2.0;
+        const double dt = Tf / N_;
+        const auto predicted_for_behavior = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
+        applyDynamicBehaviorPlanning(x_ref_, y_ref_, predicted_for_behavior, current_state_, dt);
+
+        std::vector<double> theta_sub = buildHeadingRefFromPath(
+            x_ref_, y_ref_, current_state_[2]);
+        while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
             theta_sub.push_back(theta_sub.back());
+        if (theta_sub.empty()) {
+            publishVelocity(0.0, 0.0);
+            return;
+        }
 
         std::vector<double> all_obs_x, all_obs_y;
         all_obs_x.insert(all_obs_x.end(), obs_x_.begin(), obs_x_.end());
         all_obs_x.insert(all_obs_x.end(), map_x_.begin(), map_x_.end());
         all_obs_y.insert(all_obs_y.end(), obs_y_.begin(), obs_y_.end());
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
+        t_after_theta_obs = ros::WallTime::now();
 
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
+        t_after_solve = ros::WallTime::now();
 
         if (success) {
             if (mode_ == ControlMode::ROTATION_SHIM) {
@@ -1030,6 +1247,18 @@ void MPCNode::run() {
             v_opt_ = 0.0; w_opt_ = 0.0;
             publishVelocity(0.0, 0.0);
             ROS_WARN("MPC solve failed — stopping robot");
+        }
+
+        if (bench_log_enabled_) {
+            const auto t_run_end = ros::WallTime::now();
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][run] total=" << (t_run_end - t_run_start).toSec() * 1e3 << " ms"
+                << " | ref_build=" << (t_after_refs - t_run_start).toSec() * 1e3 << " ms"
+                << " | theta_obs_merge=" << (t_after_theta_obs - t_after_refs).toSec() * 1e3 << " ms"
+                << " | solveOCP_call=" << (t_after_solve - t_after_theta_obs).toSec() * 1e3 << " ms"
+                << " | cmd_publish=" << (t_run_end - t_after_solve).toSec() * 1e3 << " ms"
+                << " | obs_counts(laser,map,dyn)="
+                << obs_x_.size() << "," << map_x_.size() << "," << dynamic_obstacles_.size());
         }
     } catch (const std::exception& e) {
         ROS_ERROR("Exception in MPC run: %s", e.what());
