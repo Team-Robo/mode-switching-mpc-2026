@@ -12,6 +12,8 @@ find_package(catkin REQUIRED COMPONENTS
     visualization_msgs
     message_generation
     tf
+    tf2
+    tf2_geometry_msgs
     tf_conversions
     laser_geometry
     pcl_ros
@@ -77,6 +79,8 @@ catkin_package(
         visualization_msgs
         message_runtime
         tf
+        tf2
+        tf2_geometry_msgs
         tf_conversions
         laser_geometry
         pcl_ros
