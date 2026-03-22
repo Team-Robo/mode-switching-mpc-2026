@@ -3,30 +3,29 @@
   <!-- <param name="global_plan_topic" value="/move_base/HybridAStarPlanner/plan" /> -->
 
     <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
-        <arg name="rviz" value="true"/>
+        <arg name="rviz" value="false"/>
         <arg name="tracker_bridge" value="false"/>
     </include>
     <!-- <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/> -->
 
     <!-- Start the navigation stack -->
-    <!-- The configuration files are loaded from jackal_helper -->
     <node pkg="move_base" type="move_base" respawn="false" name="move_base" output="screen">
 
-        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+        <rosparam file="$(find teamrobo2026)/configs/params/costmap_common_params.yaml"
             command="load" ns="global_costmap" />
-        <rosparam file="$(find jackal_helper)/configs/params/costmap_common_params.yaml"
+        <rosparam file="$(find teamrobo2026)/configs/params/costmap_common_params.yaml"
             command="load" ns="local_costmap" />
 
         <rosparam
-            file="$(find jackal_helper)/configs/params/odom_nav_params/global_costmap_params_mpc_tuned.yaml"
+            file="$(find teamrobo2026)/configs/params/odom_nav_params/global_costmap_params.yaml"
             command="load" />
         <rosparam
-            file="$(find jackal_helper)/configs/params/odom_nav_params/local_costmap_params_mpc_tuned.yaml"
+            file="$(find teamrobo2026)/configs/params/odom_nav_params/local_costmap_params.yaml"
             command="load" />
 
-        <rosparam file="$(find jackal_helper)/configs/params/base_local_planner_params.yaml"
+        <rosparam file="$(find teamrobo2026)/configs/params/base_local_planner_params.yaml"
             command="load" />
-        <rosparam file="$(find jackal_helper)/configs/params/move_base_params.yaml" command="load" />
+        <rosparam file="$(find teamrobo2026)/configs/params/move_base_params.yaml" command="load" />
 
         <!-- <param name="base_global_planner" type="string" value="hybrid_astar_planner/HybridAStarPlanner" /> -->
         <!-- <param name="base_global_planner" type="string" value="carrot_planner/CarrotPlanner" /> -->
