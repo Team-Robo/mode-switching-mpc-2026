@@ -2,10 +2,10 @@
 
   <!-- <param name="global_plan_topic" value="/move_base/HybridAStarPlanner/plan" /> -->
 
-    <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
+    <!-- <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
         <arg name="rviz" value="false"/>
         <arg name="tracker_bridge" value="false"/>
-    </include>
+    </include> -->
     <!-- <node name="rviz" pkg="rviz" type="rviz" args="-d $(find obstacle_detector)/resources/jackal_obs_tracker.rviz"/> -->
 
     <!-- Start the navigation stack -->
