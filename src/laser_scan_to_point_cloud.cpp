@@ -28,10 +28,13 @@ private:
 
     bool bench_log_enabled_ = true;
     double bench_log_period_s_ = 1.0;
-    
+
+    std::string odom_frame_ = "odom";
+    std::string laser_frame_ = "front_laser";
+
 public:
     LaserScanToPointCloud(ros::NodeHandle& nh) : has_new_data_(false) {
-        sub_laser_scan = nh.subscribe(TOPIC_LASER_SCAN, 1, 
+        sub_laser_scan = nh.subscribe(TOPIC_LASER_SCAN, 1,
                                       &LaserScanToPointCloud::callbackLaserScan, this);
         pub_point_cloud_odom = nh.advertise<sensor_msgs::PointCloud2>(
                                       TOPIC_POINT_CLOUD_ODOM, 1);
@@ -39,6 +42,8 @@ public:
         ros::NodeHandle nh_private("~");
         nh_private.param<bool>("bench_log_enabled", bench_log_enabled_, true);
         nh_private.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+        nh_private.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
+        nh_private.param<std::string>("laser_frame", laser_frame_, std::string("front_laser"));
         ROS_INFO("[LaserScanToPointCloud] bench logging: enabled=%s period=%.2fs",
                  bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
     }
@@ -87,13 +92,13 @@ public:
         
         try {
             // Strategy 1: Try the exact timestamp first
-            tf_listener.lookupTransform("/odom", "/front_laser", 
+            tf_listener.lookupTransform(odom_frame_, laser_frame_,
                                        point_cloud.header.stamp, transform);
         } catch (tf::TransformException& ex) {
             try {
                 // Strategy 2: Use the latest available transform (time 0)
                 // This is more robust and prevents extrapolation errors
-                tf_listener.lookupTransform("/odom", "/front_laser", 
+                tf_listener.lookupTransform(odom_frame_, laser_frame_,
                                            ros::Time(0), transform);
                 
                 // Update the point cloud timestamp to match the transform
@@ -115,7 +120,7 @@ public:
         
         // Create output point cloud
         sensor_msgs::PointCloud2 output_cloud;
-        output_cloud.header.frame_id = "odom";
+        output_cloud.header.frame_id = odom_frame_;
         output_cloud.header.stamp = point_cloud.header.stamp;
         output_cloud.height = 1;
         output_cloud.is_dense = false;

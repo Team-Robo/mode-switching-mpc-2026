@@ -9,7 +9,7 @@
 
 class OccupancyToCloud {
 private:
-    const double BOX_HALFLENGTH = 1.0;
+    const double BOX_LENGTH = 1.0;  // full side of local search bbox around the robot [m]
     const double PORTION_OF_PI = 3.0 / 4.0;
     const std::string TOPIC_LOCAL_MAP = "/move_base/local_costmap/costmap";
     const std::string TOPIC_MAP_CLOUD = "/map/cloud";
@@ -24,6 +24,9 @@ private:
     bool bench_log_enabled_ = true;
     double bench_log_period_s_ = 1.0;
 
+    std::string odom_frame_ = "odom";
+    std::string base_frame_ = "base_link";
+
     ros::Subscriber sub_map;
     ros::Publisher pub_point_cloud;
     tf::TransformListener tf_listener;
@@ -37,6 +40,8 @@ public:
         ros::NodeHandle nh_private("~");
         nh_private.param<bool>("bench_log_enabled", bench_log_enabled_, true);
         nh_private.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+        nh_private.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
+        nh_private.param<std::string>("base_frame", base_frame_, std::string("base_link"));
         ROS_INFO("[OccupancyToCloud] bench logging: enabled=%s period=%.2fs",
                  bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
     }
@@ -102,7 +107,7 @@ public:
 
         tf::StampedTransform transform;
         try {
-            tf_listener.lookupTransform("/odom", "/base_link", ros::Time(0), transform);
+            tf_listener.lookupTransform(odom_frame_, base_frame_, ros::Time(0), transform);
         } catch (tf::TransformException& ex) {
             ROS_WARN_THROTTLE(1.0, "TF lookup failed: %s", ex.what());
             return;
@@ -117,7 +122,7 @@ public:
         double x_map_to_chassis = tx - map_origin[0];
         double y_map_to_chassis = ty - map_origin[1];
 
-        double half = BOX_HALFLENGTH / 2.0;
+        double half = BOX_LENGTH / 2.0;
         double tl_x = x_map_to_chassis - half,  tl_y = y_map_to_chassis - half;
         double br_x = x_map_to_chassis + half,  br_y = y_map_to_chassis + half;
 
@@ -206,7 +211,7 @@ public:
         // Build PointCloud2
         // -----------------------------------------------------------------------
         sensor_msgs::PointCloud2 pointcloud;
-        pointcloud.header.frame_id = "odom";
+        pointcloud.header.frame_id = odom_frame_;
         pointcloud.header.stamp    = ros::Time::now();
         pointcloud.height          = 1;
         pointcloud.is_dense        = false;

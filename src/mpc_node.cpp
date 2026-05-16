@@ -78,6 +78,7 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("dyn_plan_smoothing", dyn_plan_smoothing_, 0.35);
 
     nh_private_.param<double>("min_spacing_global_plan", min_spacing_global_plan_, 0.14);
+    nh_private_.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
     nh_private_.param<bool>("bench_log_enabled", bench_log_enabled_, true);
     nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
 
@@ -115,8 +116,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
                                     &MPCNode::callbackGlobalPlan, this);
     sub_cloud_      = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
     sub_map_cloud_  = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
-    sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10,
-                                          &MPCNode::callbackTrackDynamicObstacle, this);
+    //sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10,
+    //                                      &MPCNode::callbackTrackDynamicObstacle, this);
 
     current_state_.resize(nx_, 0.0);
 
@@ -134,8 +135,17 @@ MPCNode::~MPCNode() {
 
 void MPCNode::initializeAcadosSolver() {
     acados_ocp_capsule_ = jackal_diff_drive_acados_create_capsule();
+    if (acados_ocp_capsule_ == nullptr) {
+        ROS_FATAL("ACADOS capsule allocation returned null — shutting down");
+        ros::shutdown();
+        return;
+    }
     int status = jackal_diff_drive_acados_create(acados_ocp_capsule_);
-    if (status != 0) { ROS_ERROR("Failed to create ACADOS solver"); return; }
+    if (status != 0) {
+        ROS_FATAL("Failed to create ACADOS solver (status=%d) — shutting down", status);
+        ros::shutdown();
+        return;
+    }
     nlp_config_ = jackal_diff_drive_acados_get_nlp_config(acados_ocp_capsule_);
     nlp_dims_   = jackal_diff_drive_acados_get_nlp_dims(acados_ocp_capsule_);
     nlp_in_     = jackal_diff_drive_acados_get_nlp_in(acados_ocp_capsule_);
@@ -665,12 +675,13 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 
     // --- Dynamic obstacle hysteresis latch ---
     ros::Time now = ros::Time::now();
-    if (has_dynamic_obs) {
-        last_dynamic_obs_time_ = now;
-    }
-    const bool dynamic_obs_active =
-        has_dynamic_obs ||
-        ((now - last_dynamic_obs_time_).toSec() < dynamic_obs_timeout_);
+    // if (has_dynamic_obs) {
+    //     last_dynamic_obs_time_ = now;
+    // }
+    // const bool dynamic_obs_active =
+    //     has_dynamic_obs ||
+    //     ((now - last_dynamic_obs_time_).toSec() < dynamic_obs_timeout_);
+    const bool dynamic_obs_active = false;
 
     bool has_static_obs = false;
     double closest_static_dist = std::numeric_limits<double>::max();
@@ -686,25 +697,26 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
     bool near_goal   = (goal_dist < rush_goal_dist_);
 
     // --- RUSH_GOAL latch management ---
-    bool facing_goal = false;
-    if (!og_x_ref_.empty()) {
-        double dx_goal = og_x_ref_.back() - current_state[0];
-        double dy_goal = og_y_ref_.back() - current_state[1];
-        double angle_to_goal = std::atan2(dy_goal, dx_goal);
-        double heading_err = diffAngle(current_state[2], angle_to_goal);
-        facing_goal = (heading_err < (45.0 * M_PI / 180.0));
-    }
-    const bool trigger_rush = near_goal && !dynamic_obs_active && !has_static_obs && facing_goal;
-
-    if (dynamic_obs_active) {
-        rush_goal_latched_ = false;
-    } else if (has_static_obs) {
-        rush_goal_latched_ = false;  // let STATIC_OBS take over
-    } else if (trigger_rush) {
-        rush_goal_latched_ = true;
-    } else if (rush_goal_latched_ && goal_dist < rush_goal_exit_dist_) {
-        rush_goal_latched_ = false;
-    }
+    // bool facing_goal = false;
+    // if (!og_x_ref_.empty()) {
+    //     double dx_goal = og_x_ref_.back() - current_state[0];
+    //     double dy_goal = og_y_ref_.back() - current_state[1];
+    //     double angle_to_goal = std::atan2(dy_goal, dx_goal);
+    //     double heading_err = diffAngle(current_state[2], angle_to_goal);
+    //     facing_goal = (heading_err < (45.0 * M_PI / 180.0));
+    // }
+    // const bool trigger_rush = near_goal && !dynamic_obs_active && !has_static_obs && facing_goal;
+    //
+    // if (dynamic_obs_active) {
+    //     rush_goal_latched_ = false;
+    // } else if (has_static_obs) {
+    //     rush_goal_latched_ = false;  // let STATIC_OBS take over
+    // } else if (trigger_rush) {
+    //     rush_goal_latched_ = true;
+    // } else if (rush_goal_latched_ && goal_dist < rush_goal_exit_dist_) {
+    //     rush_goal_latched_ = false;
+    // }
+    rush_goal_latched_ = false;
 
     // --- Primary mode assignment (priority order) ---
     if (dynamic_obs_active) {
@@ -1109,7 +1121,7 @@ void MPCNode::publishTrajectory(const std::vector<double>& x_traj,
                                 const std::vector<double>& y_traj) {
     nav_msgs::Path path;
     path.header.stamp    = ros::Time::now();
-    path.header.frame_id = "odom";
+    path.header.frame_id = odom_frame_;
     for (size_t i = 0; i < x_traj.size(); ++i) {
         geometry_msgs::PoseStamped ps;
         ps.pose.position.x = x_traj[i];
@@ -1122,7 +1134,7 @@ void MPCNode::publishTrajectory(const std::vector<double>& x_traj,
 
 void MPCNode::publishMarker() {
     visualization_msgs::Marker m;
-    m.header.frame_id = "odom";
+    m.header.frame_id = odom_frame_;
     m.header.stamp    = ros::Time::now();
     m.ns = "mpc_mode"; m.id = 0;
     m.type   = visualization_msgs::Marker::SPHERE;
@@ -1160,7 +1172,10 @@ void MPCNode::publishMarker() {
 // Main loop
 // =============================================================================
 void MPCNode::run() {
-    std::lock_guard<std::mutex> lock(solver_mutex_);
+    if (nlp_config_ == nullptr) {
+        ROS_ERROR_THROTTLE(5.0, "ACADOS solver not initialized — skipping run()");
+        return;
+    }
     try {
         const auto t_run_start = ros::WallTime::now();
         ros::WallTime t_after_refs = t_run_start;

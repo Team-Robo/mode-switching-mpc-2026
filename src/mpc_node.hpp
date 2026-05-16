@@ -16,10 +16,6 @@
 #include <string>
 #include <cmath>
 #include <memory>
-#include <mutex>
-#include <pcl/point_types.h>
-#include <pcl/kdtree/kdtree_flann.h>
-#include <pcl/point_cloud.h>
 
 // ACADOS interface
 extern "C" {
@@ -75,8 +71,6 @@ private:
     ros::Publisher pub_mpc_plan_;
     ros::Publisher pub_marker_;
 
-    std::mutex solver_mutex_;
-
     // Subscribers
     ros::Subscriber sub_odom_;
     ros::Subscriber sub_global_plan_;
@@ -93,12 +87,12 @@ private:
 
     // ACADOS
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
-    ocp_nlp_config* nlp_config_;
-    ocp_nlp_dims*   nlp_dims_;
-    ocp_nlp_in*     nlp_in_;
-    ocp_nlp_out*    nlp_out_;
-    ocp_nlp_solver* nlp_solver_;
-    void*           nlp_opts_;
+    ocp_nlp_config* nlp_config_ = nullptr;
+    ocp_nlp_dims*   nlp_dims_   = nullptr;
+    ocp_nlp_in*     nlp_in_     = nullptr;
+    ocp_nlp_out*    nlp_out_    = nullptr;
+    ocp_nlp_solver* nlp_solver_ = nullptr;
+    void*           nlp_opts_   = nullptr;
 
     void initializeAcadosSolver();
     void cleanupAcadosSolver();
@@ -271,12 +265,6 @@ private:
     std::vector<double> obs_x_, obs_y_;
     std::vector<double> map_x_, map_y_;
 
-    // Cached KD-tree for static obstacles (rebuilt on each cloud callback)
-    pcl::PointCloud<pcl::PointXYZ>::Ptr static_obs_cloud_;
-    pcl::KdTreeFLANN<pcl::PointXYZ>    static_obs_kdtree_;
-    bool                                static_obs_kdtree_valid_ = false;
-    void rebuildStaticKdtree();
-
     ros::Time last_dynamic_obs_time_;
     double dynamic_obs_timeout_ = 0.35;
 
@@ -288,6 +276,9 @@ private:
 
     // Minimum spacing (meters) when subsampling the global plan for MPC refs.
     double min_spacing_global_plan_ = 0.14;
+
+    // TF frame for published trajectories / markers
+    std::string odom_frame_ = "odom";
 
     // Benchmark logging controls
     bool   bench_log_enabled_   = true;
