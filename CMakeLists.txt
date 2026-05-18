@@ -1,16 +1,14 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(teamrobo2026)
 
-## Find catkin and required packages
-find_package(catkin REQUIRED COMPONENTS
+set(dependencies
     roscpp
-    rospy
+    # rospy
     std_msgs
     sensor_msgs
     geometry_msgs
     nav_msgs
     visualization_msgs
-    message_generation
     tf
     tf2
     tf2_geometry_msgs
@@ -19,6 +17,10 @@ find_package(catkin REQUIRED COMPONENTS
     pcl_ros
     pcl_conversions
     obstacle_detector
+)
+# Find catkin and required packages
+find_package(catkin REQUIRED COMPONENTS
+    ${dependencies}
 )
 
 ## Find system dependencies
@@ -43,49 +45,17 @@ if(NOT ACADOS_INSTALL_DIR)
 else()
     message(STATUS "ACADOS installation directory: ${ACADOS_INSTALL_DIR}")
     
-    # ACADOS include directories
-    set(ACADOS_INCLUDE_DIRS
-        ${ACADOS_INSTALL_DIR}/include
-        ${ACADOS_INSTALL_DIR}/include/blasfeo/include
-        ${ACADOS_INSTALL_DIR}/include/hpipm/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code
-    )
+    set(acados_include "${ACADOS_INSTALL_DIR}/include")
+    set(acados_lib "${ACADOS_INSTALL_DIR}/lib")
+    set(full_model_build "${CMAKE_CURRENT_SOURCE_DIR}/script/c_generated_code")
     
-    # ACADOS library directories
-    set(ACADOS_LIBRARY_DIRS
-        ${ACADOS_INSTALL_DIR}/lib
-        ${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code
-    )
-    
-    # ACADOS libraries
-    set(ACADOS_LIBRARIES
-        acados
-        blasfeo
-        hpipm
-    )
 endif()
 
 ###################################
 ## catkin specific configuration ##
 ###################################
 catkin_package(
-    CATKIN_DEPENDS 
-        roscpp 
-        rospy
-        std_msgs 
-        sensor_msgs 
-        geometry_msgs 
-        nav_msgs
-        visualization_msgs
-        message_runtime
-        tf
-        tf2
-        tf2_geometry_msgs
-        tf_conversions
-        laser_geometry
-        pcl_ros
-        pcl_conversions
-        obstacle_detector   
+    CATKIN_DEPENDS ${dependencies}
 )
 
 ###########
@@ -94,18 +64,22 @@ catkin_package(
 
 ## Specify additional locations of header files
 include_directories(
-    include
+    include # cpp "include" directory
     ${catkin_INCLUDE_DIRS}
-    ${EIGEN3_INCLUDE_DIRS}
     ${PCL_INCLUDE_DIRS}
+    ${acados_include}
+    ${acados_include}/blasfeo/include/
+    ${acados_include}/hpipm/include/
+    ${acados_include}/acados/
+    ${acados_include}/qpOASES_e/
+    ${full_model_build}
+    ${EIGEN3_INCLUDE_DIRS}
     ${GAZEBO_INCLUDE_DIRS}
-    ${ACADOS_INCLUDE_DIRS}
 )
 
 link_directories(
     ${GAZEBO_LIBRARY_DIRS}
     ${PCL_LIBRARY_DIRS}
-    ${ACADOS_LIBRARY_DIRS}
 )
 
 ## Add compile definitions
@@ -120,10 +94,6 @@ add_executable(inspection_node
 target_link_libraries(inspection_node
     ${catkin_LIBRARIES}
 )
-add_dependencies(inspection_node 
-    ${${PROJECT_NAME}_EXPORTED_TARGETS} 
-    ${catkin_EXPORTED_TARGETS}
-)
 
 # Laser scan to point cloud node
 add_executable(laser_scan_to_point_cloud_node 
@@ -133,10 +103,6 @@ target_link_libraries(laser_scan_to_point_cloud_node
     ${catkin_LIBRARIES}
     ${EIGEN3_LIBRARIES}
 )
-add_dependencies(laser_scan_to_point_cloud_node 
-    ${${PROJECT_NAME}_EXPORTED_TARGETS} 
-    ${catkin_EXPORTED_TARGETS}
-)
 
 # Occupancy grid to point cloud node
 add_executable(occupancy_to_cloud_node 
@@ -145,10 +111,6 @@ add_executable(occupancy_to_cloud_node
 target_link_libraries(occupancy_to_cloud_node
     ${catkin_LIBRARIES}
 )
-add_dependencies(occupancy_to_cloud_node 
-    ${${PROJECT_NAME}_EXPORTED_TARGETS} 
-    ${catkin_EXPORTED_TARGETS}
-)
 
 # MPC node with ACADOS
 if(ACADOS_INSTALL_DIR)
@@ -156,48 +118,27 @@ if(ACADOS_INSTALL_DIR)
         src/mpc_node.cpp
     )
     
-    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code/acados_solver_jackal_diff_drive.c")
-        # Build the ACADOS solver library from source
-        add_library(acados_solver_lib STATIC
-            c_generated_code/acados_solver_jackal_diff_drive.c
-            c_generated_code/acados_sim_solver_jackal_diff_drive.c
-            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_ode_fun.c
-            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_forw.c
-            c_generated_code/jackal_diff_drive_model/jackal_diff_drive_expl_vde_adj.c
-            c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun.c
-            c_generated_code/jackal_diff_drive_constraints/jackal_diff_drive_constr_h_fun_jac_uxt_zt.c
-        )
-        target_include_directories(acados_solver_lib PUBLIC
-            ${ACADOS_INCLUDE_DIRS}
-        )
-        
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/script/c_generated_code")    
         target_link_libraries(mpc_node
-            acados_solver_lib
             ${catkin_LIBRARIES}
-            ${ACADOS_LIBRARIES}
-            m  # Math library
+            ${full_model_build}/libacados_ocp_solver_jackal_diff_drive.so
+            ${acados_lib}/libacados.so
         )
     else()
         message(WARNING "ACADOS generated code not found. Please run generate_acados_solver.py first.")
         target_link_libraries(mpc_node
             ${catkin_LIBRARIES}
-            ${ACADOS_LIBRARIES}
-            m  # Math library
         )
     endif()
     
-    add_dependencies(mpc_node 
-        ${${PROJECT_NAME}_EXPORTED_TARGETS} 
-        ${catkin_EXPORTED_TARGETS}
-    )
 else()
     message(WARNING "ACADOS not configured. MPC node will not be built.")
 endif()
 
-catkin_install_python(PROGRAMS 
-  script/generate_acados_solver.py
-  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
-)
+# catkin_install_python(PROGRAMS 
+#   script/generate_acados_solver.py
+#   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+# )
 
 # # Collision publisher node (from original CMakeLists)
 # add_executable(collision_publisher_node 
