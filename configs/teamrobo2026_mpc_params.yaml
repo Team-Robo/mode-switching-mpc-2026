@@ -29,8 +29,8 @@ teamrobo2026:
   reversal_threshold: 0.9
   reversal_angle_deg: 85.0
 
-  lidar_blind_angle_deg: 39.0
-  shim_exit_heading_deg: 15.0
+  lidar_blind_angle_deg: 45.0 # 39.0
+  shim_exit_heading_deg: 90.0 # 15.0
   shim_omega: 0.8
 
   obs_search_radius: 5.0
