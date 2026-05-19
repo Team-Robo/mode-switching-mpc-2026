@@ -39,7 +39,7 @@
     </node>
     <rosparam file="$(find teamrobo2026)/configs/teamrobo2026_mpc_params.yaml" command="load" />
     <node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud" output="screen">
-        <param name="laser_frame" value="front_laser" />
+        <param name="laser_frame" value="mid_laser" />
     </node>
     <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud" output="screen"></node>
     <node pkg="teamrobo2026" type="mpc_node" name="teamrobo2026" output="screen"></node>

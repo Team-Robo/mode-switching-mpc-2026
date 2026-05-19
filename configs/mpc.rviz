@@ -231,11 +231,11 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
-        front_laser:
+        mid_laser:
           Alpha: 1
           Show Axes: false
           Show Trail: false
-        front_laser_mount:
+        mid_laser_mount:
           Alpha: 1
           Show Axes: false
           Show Trail: false
