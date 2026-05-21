@@ -743,77 +743,49 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
     }
 
-    // =========================================================================
-    // 4b. ROTATION_SHIM — evaluated after primary mode, overrides everything
-    //     except DYNAMIC_OBS (a moving obstacle trumps a blind-spot spin).
-    //
-    //     Triggers when a reversal is needed AND the goal direction falls inside
-    //     the lidar blind zone.  The robot spins in place until the goal clears
-    //     the blind zone edge (plus shim_exit_heading_deg_ buffer), then this
-    //     mode releases and normal reversal takes over.
-    // =========================================================================
+    // =====================================================================
+    // 4b. ROTATION_SHIM — overrides all non-DYNAMIC_OBS modes whenever the
+    //     robot heading is too far off the path heading.
+    // =====================================================================
     if (mode_ != ControlMode::DYNAMIC_OBS) {
-        bool reversal_pending = checkReversalNeeded(theta_ref, current_state[2]);
+        // Angular error from robot heading to first meaningful path heading.
+        // theta_ref is the forward path heading — during reversal this will
+        // naturally be ~180° off, so reversal is covered automatically.
+        const double path_heading = (theta_ref.size() > 1) ? theta_ref[1] : 
+                                    (!theta_ref.empty() ? theta_ref[0] : current_state[2]);
+        double angular_err = path_heading - current_state[2];
+        while (angular_err >  M_PI) angular_err -= 2.0 * M_PI;
+        while (angular_err < -M_PI) angular_err += 2.0 * M_PI;
 
-        if (reversal_pending && !og_x_ref_.empty()) {
-            double gx = og_x_ref_.back();
-            double gy = og_y_ref_.back();
-            bool in_blind = isGoalInBlindSpot(current_state[2], gx, gy,
-                                              current_state[0], current_state[1]);
+        // shim_exit_heading_deg_ reused as the ENGAGE threshold (e.g. 90°).
+        // Disengage at half to avoid chattering at the boundary.
+        const double engage_rad    = shim_exit_heading_deg_ * M_PI / 180.0;
+        const double disengage_rad = engage_rad * 0.5;
 
-            // Entry: latch the shim ON and choose spin direction once.
-            if (!shim_active_ && in_blind) {
-                shim_active_ = true;
-
-                // Rotate toward whichever side brings the goal into the FOV
-                // faster — use the cross product to find which side the goal is on.
-                double dx = gx - current_state[0];
-                double dy = gy - current_state[1];
-                // Cross product z-component: positive → goal is left of heading
-                double cross = std::cos(current_state[2]) * dy
-                             - std::sin(current_state[2]) * dx;
-                shim_turn_left_ = (cross > 0.0);
-                ROS_INFO("ROTATION_SHIM engaged — turning %s (goal in blind spot)",
-                         shim_turn_left_ ? "LEFT" : "RIGHT");
-            }
-
-            // Exit: use shim_exit_heading_deg_ as an angular buffer so the goal
-            // must be clearly inside the FOV before we release (avoids chattering
-            // at the blind-zone boundary).
-            if (shim_active_) {
-                double dx = gx - current_state[0];
-                double dy = gy - current_state[1];
-                double angle_to_goal = std::atan2(dy, dx);
-                double rear_dir = current_state[2] + M_PI;
-                double diff_from_rear = diffAngle(angle_to_goal, rear_dir);
-                double clear_angle = lidar_blind_angle_deg_ * M_PI / 180.0
-                                   + shim_exit_heading_deg_ * M_PI / 180.0;
-                if (diff_from_rear >= clear_angle) {
-                    shim_active_ = false;
-                    ROS_INFO("ROTATION_SHIM released — goal now %.1f deg from rear (need >= %.1f deg)",
-                             diff_from_rear * 180.0 / M_PI, clear_angle * 180.0 / M_PI);
-                }
-            }
-        } else {
-            // No reversal needed — always clear the shim.
-            if (shim_active_) {
-                shim_active_ = false;
-                ROS_INFO("ROTATION_SHIM cleared (no reversal needed)");
-            }
+        if (!shim_active_ && std::fabs(angular_err) > engage_rad) {
+            shim_active_    = true;
+            shim_turn_left_ = (angular_err > 0.0);
+            ROS_INFO("ROTATION_SHIM ON: err=%.1f deg → turning %s",
+                    angular_err * 180.0 / M_PI, shim_turn_left_ ? "LEFT" : "RIGHT");
+        }
+        if (shim_active_ && std::fabs(angular_err) < disengage_rad) {
+            shim_active_ = false;
+            ROS_INFO("ROTATION_SHIM OFF: aligned to %.1f deg (< %.1f deg threshold)",
+                    std::fabs(angular_err) * 180.0 / M_PI,
+                    disengage_rad * 180.0 / M_PI);
         }
 
         if (shim_active_) {
             mode_         = ControlMode::ROTATION_SHIM;
             display_text_ = "ROT_SHIM";
-            ROS_INFO_THROTTLE(0.5, "Mode: ROTATION_SHIM (spinning %s)",
-                              shim_turn_left_ ? "LEFT" : "RIGHT");
+            ROS_INFO_THROTTLE(0.5, "ROTATION_SHIM: spinning %s (err=%.1f deg)",
+                            shim_turn_left_ ? "LEFT" : "RIGHT",
+                            angular_err * 180.0 / M_PI);
         }
     } else {
-        // Dynamic obstacle active — disengage shim so it re-evaluates cleanly
-        // once the dynamic obstacle clears.
+        // Dynamic obstacle clears the shim so it re-evaluates once it clears.
         shim_active_ = false;
     }
-    t_after_mode = ros::WallTime::now();
 
     // =========================================================================
     // 4c. ROTATION_SHIM EARLY-EXIT — bypass the ACADOS solver completely.
