@@ -41,10 +41,19 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
+enum class StartupScanPhase {
+    IDLE,
+    SCAN_LEFT,    // rotate CCW 45°
+    SCAN_RIGHT,   // rotate CW  90°
+    SCAN_CENTER,  // rotate CCW 45° back to origin
+    DONE
+};
+
 // Priority: DYNAMIC_OBS > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
 // ROTATION_SHIM fires when a reversal is needed but the goal direction falls
 // inside the lidar blind zone — the robot spins in place until the goal is
 // visible, then hands off to normal reversal.
+
 enum class ControlMode {
     NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
     STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
@@ -108,6 +117,7 @@ private:
     void publishTrajectory(const std::vector<double>& x_traj,
                            const std::vector<double>& y_traj);
     void publishMarker();
+    void runStartupScan();
 
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
@@ -273,6 +283,14 @@ private:
     double dyn_plan_margin_ = 0.25;
     double dyn_plan_max_lateral_shift_ = 1.2;
     double dyn_plan_smoothing_ = 0.35;
+
+    bool               enable_startup_scan_   = false;
+    bool               startup_scan_done_     = false;
+    StartupScanPhase   startup_scan_phase_    = StartupScanPhase::IDLE;
+    double             startup_scan_start_yaw_ = 0.0;
+
+    static constexpr double STARTUP_SCAN_OMEGA = 0.6;
+    static constexpr double STARTUP_SCAN_STEP  = M_PI / 4.0;  // 45 degrees
 
     // Minimum spacing (meters) when subsampling the global plan for MPC refs.
     double min_spacing_global_plan_ = 0.14;

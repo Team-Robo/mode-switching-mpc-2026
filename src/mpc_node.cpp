@@ -68,6 +68,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("rush_weight_accel",    rush_weight_accel_,    0.0);
     nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
 
+    nh_private_.param<bool>("enable_startup_scan", enable_startup_scan_, true);
+
     // Dynamic obstacle hysteresis timeout
     nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.35);
 
@@ -83,6 +85,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
 
     ROS_INFO("=== MPC Node Parameters ===");
+    ROS_INFO("  Startup scan: %s (fixed sweep ±45° / 90° @ %.1f rad/s)",
+            enable_startup_scan_ ? "ENABLED" : "disabled", STARTUP_SCAN_OMEGA);
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
              v_linear_max_, v_static_obs_max_, omega_max_);
     ROS_INFO("  Weights: pos=%.2f  heading=%.2f  accel=%.4f  velocity=%.2f",
@@ -1080,6 +1084,79 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 }
 
 // =============================================================================
+// Startup Symmetrical Scan
+//   Phase sequence:  IDLE → SCAN_LEFT (+45°) → SCAN_RIGHT (−90°) → SCAN_CENTER (+45°) → DONE
+//   Fixed speed: STARTUP_SCAN_OMEGA rad/s.  All angles hard-coded.
+// =============================================================================
+void MPCNode::runStartupScan()
+{
+    const double yaw = current_state_[2];
+    auto signed_delta = [](double from, double to) -> double {
+        double d = to - from;
+        while (d >  M_PI) d -= 2.0 * M_PI;
+        while (d < -M_PI) d += 2.0 * M_PI;
+        return d;
+    };
+
+    // start yaw, begin left sweep 
+    if (startup_scan_phase_ == StartupScanPhase::IDLE) {
+        startup_scan_start_yaw_ = yaw;
+        startup_scan_phase_     = StartupScanPhase::SCAN_LEFT;
+        mode_         = ControlMode::ROTATION_SHIM;   // borrow shim colour
+        display_text_ = "SCAN_L";
+        ROS_INFO("[StartupScan] BEGIN — rotating LEFT 45°");
+    }
+
+    // rotate CCW until +45° accumulated 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_LEFT) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) < STARTUP_SCAN_STEP) {
+            publishVelocity(0.0, STARTUP_SCAN_OMEGA);
+        } else {
+            publishVelocity(0.0, 0.0);
+            startup_scan_start_yaw_ = yaw;
+            startup_scan_phase_     = StartupScanPhase::SCAN_RIGHT;
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "SCAN_R";
+            ROS_INFO("[StartupScan] LEFT done — rotating RIGHT 90°");
+        }
+        return;
+    }
+
+    // rotate CW until −90° accumulated 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_RIGHT) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) > -2.0 * STARTUP_SCAN_STEP) {
+            publishVelocity(0.0, -STARTUP_SCAN_OMEGA);
+        } else {
+            publishVelocity(0.0, 0.0);
+            startup_scan_start_yaw_ = yaw;
+            startup_scan_phase_     = StartupScanPhase::SCAN_CENTER;
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "SCAN_C";
+            ROS_INFO("[StartupScan] RIGHT done — returning to center (+45°)");
+        }
+        return;
+    }
+
+    // rotate CCW until +45° accumulated (back to origin) 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_CENTER) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) < STARTUP_SCAN_STEP) {
+            publishVelocity(0.0, STARTUP_SCAN_OMEGA);
+        } else {
+            publishVelocity(0.0, 0.0);
+            startup_scan_phase_ = StartupScanPhase::DONE;
+            startup_scan_done_  = true;
+            mode_         = ControlMode::NORMAL;
+            display_text_ = "NORMAL";
+            ROS_INFO("[StartupScan] COMPLETE — resuming normal MPC operation");
+        }
+        return;
+    }
+
+    // DONE guard (shouldn't normally be reached)
+    startup_scan_done_ = true;
+}
+
+// =============================================================================
 // Publishers
 // =============================================================================
 void MPCNode::publishVelocity(double v, double w) {
@@ -1146,6 +1223,10 @@ void MPCNode::publishMarker() {
 void MPCNode::run() {
     if (nlp_config_ == nullptr) {
         ROS_ERROR_THROTTLE(5.0, "ACADOS solver not initialized — skipping run()");
+        return;
+    }
+    if (enable_startup_scan_ && !startup_scan_done_) {
+        runStartupScan();
         return;
     }
     try {
