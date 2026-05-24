@@ -1226,6 +1226,10 @@ void MPCNode::run() {
         return;
     }
     if (enable_startup_scan_ && !startup_scan_done_) {
+        if (og_x_ref_.empty() || og_y_ref_.empty()) {
+            ROS_WARN_THROTTLE(5.0, "Waiting for global plan to start startup scan...");
+            return;
+        }
         runStartupScan();
         return;
     }
