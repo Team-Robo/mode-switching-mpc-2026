@@ -38,7 +38,14 @@ teamrobo2026:
   bench_log_enabled: false
   bench_log_period_s: 1.0
 
+lidar_filter:
+  source_topic: /front/scan
+  pub_topic: /front/scan_filtered
+  outlier_threshold: 0.1
+
 laser_scan_to_point_cloud:
+  # Overridden in move_base_mlda_2026.launch from enable_lidar_filter (filtered vs raw).
+  scan_topic: /front/scan_filtered
   bench_log_enabled: false
   bench_log_period_s: 1.0
 

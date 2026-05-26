@@ -113,6 +113,18 @@ add_definitions(${PCL_DEFINITIONS})
 
 ## Declare C++ executables
 
+# Lidar scan outlier filter node
+add_executable(lidar_filter_node
+    src/lidar_filter_node.cpp
+)
+target_link_libraries(lidar_filter_node
+    ${catkin_LIBRARIES}
+)
+add_dependencies(lidar_filter_node
+    ${${PROJECT_NAME}_EXPORTED_TARGETS}
+    ${catkin_EXPORTED_TARGETS}
+)
+
 # Inspection node
 add_executable(inspection_node 
     src/inspection_node.cpp
@@ -217,6 +229,7 @@ catkin_install_python(PROGRAMS
 
 ## Mark executables for installation
 install(TARGETS 
+    lidar_filter_node
     inspection_node
     laser_scan_to_point_cloud_node
     occupancy_to_cloud_node

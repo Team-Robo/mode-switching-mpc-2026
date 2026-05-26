@@ -1,5 +1,10 @@
 <launch>
 
+  <!-- When false, costmap and laser_scan_to_point_cloud use raw /front/scan. -->
+  <arg name="enable_lidar_filter" default="true" />
+  <arg name="laser_scan_topic" value="front/scan_filtered" if="$(arg enable_lidar_filter)" />
+  <arg name="laser_scan_topic" value="front/scan" unless="$(arg enable_lidar_filter)" />
+
   <!-- <param name="global_plan_topic" value="/move_base/HybridAStarPlanner/plan" /> -->
 
     <!-- <include file="$(find obstacle_detector)/launch/jackal_obstacle_tracking.launch">
@@ -15,6 +20,8 @@
             command="load" ns="global_costmap" />
         <rosparam file="$(find teamrobo2026)/configs/params/costmap_common_params.yaml"
             command="load" ns="local_costmap" />
+        <param name="global_costmap/obstacles_layer/scan/topic" value="$(arg laser_scan_topic)" />
+        <param name="local_costmap/obstacles_layer/scan/topic" value="$(arg laser_scan_topic)" />
 
         <rosparam
             file="$(find teamrobo2026)/configs/params/odom_nav_params/global_costmap_params.yaml"
@@ -38,7 +45,11 @@
         <remap from="cmd_vel" to="dump/cmd_vel" />
     </node>
     <rosparam file="$(find teamrobo2026)/configs/teamrobo2026_mpc_params.yaml" command="load" />
+    <group if="$(arg enable_lidar_filter)">
+        <node pkg="teamrobo2026" type="lidar_filter_node" name="lidar_filter" output="screen" />
+    </group>
     <node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud" output="screen">
+        <param name="scan_topic" value="/$(arg laser_scan_topic)" />
         <param name="laser_frame" value="mid_laser" />
     </node>
     <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud" output="screen"></node>
