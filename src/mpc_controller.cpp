@@ -301,7 +301,7 @@ double MpcController::diffAngle(double a1, double a2) const {
     return diff;
 }
 
-bool MpcController::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
+bool MpcController::isLeft(double rx, double ry, double rtheta, double ox, double oy) const {
     double dx = ox - rx, dy = oy - ry;
     return (-std::sin(rtheta)*dx + std::cos(rtheta)*dy) > 0;
 }
@@ -558,15 +558,15 @@ void MpcController::warmStartFromCurrentState(const std::vector<double>& current
 }
 
 // =============================================================================
-// selectObstacles — 2 closest static + up to 10 dynamic obstacles
+// selectObstacles — nearest left/right static + up to 10 dynamic obstacles
 //   p_data layout: [x0,y0, x1,y1,   x2,y2, ..., x11,y11]
-//                   ^---static---^   ^-------dynamic-------^
+//                   ^left ^right     ^-------dynamic-------^
 // =============================================================================
 void MpcController::selectObstacles(
     const std::vector<double>& obs_x,
     const std::vector<double>& obs_y,
     const std::vector<PredictedObstacle>& predicted_obstacles,
-    double rx, double ry,
+    double rx, double ry, double rtheta,
     int stage,
     double search_radius_sq,
     double p_data[24]) const
@@ -574,29 +574,37 @@ void MpcController::selectObstacles(
     constexpr int N_STATIC  = 2;
     constexpr int N_DYNAMIC = 10;
 
-    // --- 2 closest static obstacles ---
-    struct StaticCand { double x, y, dist_sq; };
-    std::vector<StaticCand> static_cands;
-    static_cands.reserve(obs_x.size());
+    // --- nearest static on left and right (robot frame via isLeft) ---
+    double left_dist_sq  = std::numeric_limits<double>::infinity();
+    double right_dist_sq = std::numeric_limits<double>::infinity();
+    double left_x  = 1000.0, left_y  = 1000.0;
+    double right_x = 1000.0, right_y = 1000.0;
+
     for (size_t j = 0; j < obs_x.size(); ++j) {
-        double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
-        double d2 = dx*dx + dy*dy;
+        const double dx = obs_x[j] - rx;
+        const double dy = obs_y[j] - ry;
+        const double d2 = dx * dx + dy * dy;
         if (d2 > search_radius_sq) continue;
-        static_cands.push_back({obs_x[j], obs_y[j], d2});
-    }
-    std::partial_sort(static_cands.begin(),
-                      static_cands.begin() + std::min((int)static_cands.size(), N_STATIC),
-                      static_cands.end(),
-                      [](const StaticCand& a, const StaticCand& b){ return a.dist_sq < b.dist_sq; });
-    for (int k = 0; k < N_STATIC; ++k) {
-        if (k < (int)static_cands.size()) {
-            p_data[2*k+0] = static_cands[k].x;
-            p_data[2*k+1] = static_cands[k].y;
+
+        if (isLeft(rx, ry, rtheta, obs_x[j], obs_y[j])) {
+            if (d2 < left_dist_sq) {
+                left_dist_sq = d2;
+                left_x = obs_x[j];
+                left_y = obs_y[j];
+            }
         } else {
-            p_data[2*k+0] = 1000.0;
-            p_data[2*k+1] = 1000.0;
+            if (d2 < right_dist_sq) {
+                right_dist_sq = d2;
+                right_x = obs_x[j];
+                right_y = obs_y[j];
+            }
         }
     }
+
+    p_data[0] = left_x;
+    p_data[1] = left_y;
+    p_data[2] = right_x;
+    p_data[3] = right_y;
 
     // --- up to 10 dynamic obstacles (sorted by effective distance) ---
     struct DynCand { double x, y, eff_dist; };
@@ -1078,8 +1086,9 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
                     local_obs_y.push_back(cloud->points[idx].y);
                 }
             }
+            const double pred_theta = (i == 0) ? current_state[2] : st;
             selectObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
-                            pred_x, pred_y,
+                            pred_x, pred_y, pred_theta,
                             i, search_radius_sq, p_data);
         }
 

@@ -19,6 +19,8 @@ private:
     std::string source_topic_;
     std::string pub_topic_;
     double outlier_threshold_;
+    bool bench_log_enabled_ = true;
+    double bench_log_period_s_ = 1.0;
 
     void lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan);
 };
@@ -27,20 +29,29 @@ LidarFilter::LidarFilter(ros::NodeHandle& nh, ros::NodeHandle& pnh) : nh_(nh) {
     pnh.param<std::string>("source_topic", source_topic_, "/front/scan");
     pnh.param<std::string>("pub_topic", pub_topic_, "/front/scan_filtered");
     pnh.param<double>("outlier_threshold", outlier_threshold_, 0.1);
+    pnh.param<bool>("bench_log_enabled", bench_log_enabled_, true);
+    pnh.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
 
     scan_pub_ = nh_.advertise<sensor_msgs::LaserScan>(pub_topic_, 10);
     scan_sub_ = nh_.subscribe<sensor_msgs::LaserScan>(
         source_topic_, 10, &LidarFilter::lidarCallback, this);
 
-    ROS_INFO("[lidar_filter] %s -> %s (outlier_threshold=%.3f m)",
-             source_topic_.c_str(), pub_topic_.c_str(), outlier_threshold_);
+    ROS_INFO("[lidar_filter] %s -> %s threshold=%.3f m bench=%s period=%.2fs",
+             source_topic_.c_str(), pub_topic_.c_str(), outlier_threshold_,
+             bench_log_enabled_ ? "on" : "off", bench_log_period_s_);
 }
 
 void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
+    const auto t_start = ros::WallTime::now();
     const int n_ranges = static_cast<int>(scan->ranges.size());
 
     if (n_ranges < 3) {
         scan_pub_.publish(scan);
+        if (bench_log_enabled_) {
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][lidar_filter] ranges=" << n_ranges
+                << " filtered=0 kept=" << n_ranges << " (passthrough, n<3)");
+        }
         return;
     }
 
@@ -58,6 +69,9 @@ void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
         filtered.intensities = scan->intensities;
     }
 
+    int n_filtered = 0;
+    int n_valid_interior = 0;
+
     for (int i = 1; i < n_ranges - 1; ++i) {
         const float prev_range = filtered.ranges[i - 1];
         const float current_range = filtered.ranges[i];
@@ -70,6 +84,7 @@ void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
         if (!current_valid) {
             continue;
         }
+        ++n_valid_interior;
 
         if (std::abs(current_range - prev_range) > outlier_threshold_ &&
             std::abs(current_range - next_range) > outlier_threshold_) {
@@ -78,10 +93,32 @@ void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
                 i < static_cast<int>(filtered.intensities.size())) {
                 filtered.intensities[i] = 0.0f;
             }
+            ++n_filtered;
         }
     }
 
     scan_pub_.publish(filtered);
+
+    if (bench_log_enabled_) {
+        int n_output_valid = 0;
+        for (float r : filtered.ranges) {
+            if (std::isfinite(r) && r >= filtered.range_min && r <= filtered.range_max) {
+                ++n_output_valid;
+            }
+        }
+        const auto t_end = ros::WallTime::now();
+        ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+            "[BENCH][lidar_filter] total=" << (t_end - t_start).toSec() * 1e3 << " ms"
+            << " | ranges=" << n_ranges
+            << " interior_valid=" << n_valid_interior
+            << " filtered=" << n_filtered
+            << " output_valid=" << n_output_valid
+            << " | filter_rate="
+            << (n_valid_interior > 0
+                    ? 100.0 * n_filtered / n_valid_interior
+                    : 0.0)
+            << "%");
+    }
 }
 
 int main(int argc, char** argv) {

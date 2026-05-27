@@ -138,7 +138,7 @@ private:
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
                             double curr_x, double curr_y, int& min_idx);
-    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy);
+    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy) const;
 
     // Reversal
     bool checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta);
@@ -165,13 +165,13 @@ private:
         double current_heading) const;
 
     // =========================================================================
-    // Obstacle selection — 2 closest static + up to 10 dynamic (24 params)
+    // Obstacle selection — nearest left/right static + up to 10 dynamic (24 params)
     // =========================================================================
     void selectObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
         const std::vector<PredictedObstacle>& predicted_obstacles,
-        double rx, double ry,
+        double rx, double ry, double rtheta,
         int stage,
         double search_radius_sq,
         double p_data[24]) const;
