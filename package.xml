@@ -34,6 +34,9 @@
   <build_depend>pcl_conversions</build_depend>
   <build_depend>eigen</build_depend>
   <build_depend>obstacle_detector</build_depend>
+  <build_depend>nav_core</build_depend>
+  <build_depend>costmap_2d</build_depend>
+  <build_depend>pluginlib</build_depend>
 
   <build_export_depend>roscpp</build_export_depend>
   <build_export_depend>rospy</build_export_depend>
@@ -68,10 +71,12 @@
   <exec_depend>pcl_conversions</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>obstacle_detector</exec_depend>
+  <exec_depend>nav_core</exec_depend>
+  <exec_depend>costmap_2d</exec_depend>
+  <exec_depend>pluginlib</exec_depend>
+  <exec_depend>move_base</exec_depend>
 
-  <!-- The export tag contains other, unspecified, tags -->
   <export>
-    <!-- Other tools can request additional information be placed here -->
-
+    <nav_core plugin="${prefix}/plugins/mpc_local_planner_plugin.xml"/>
   </export>
 </package>

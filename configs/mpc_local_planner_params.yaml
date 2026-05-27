@@ -1,0 +1,46 @@
+# Loaded under move_base with ns MpcLocalPlannerROS (private ~ params).
+position_weight_mult_dynamic: 0.7000000000000001
+heading_weight_mult_dynamic: 0.44999999999999996
+accel_weight_mult_dynamic: 4.9711669468300554
+vel_weight_mult_dynamic: 1.113057650495854
+
+weight_position_error: 155.0
+weight_heading_error: 92.0
+weight_velocity: 50.0
+weight_acceleration: 0.0003088547426299309
+static_obs_safe_dist: 1.2
+
+min_spacing_global_plan: 0.05
+
+v_static_obs_max: 0.8
+omega_static_obs_max: 0.6699999999999999
+
+dynamic_obs_safe_dist: 8.8
+dynamic_obs_timeout: 0.35
+
+dyn_plan_influence_dist: 4.0
+dyn_plan_margin: 0.25
+dyn_plan_max_lateral_shift: 1.2
+dyn_plan_smoothing: 0.35
+
+rush_goal_dist: 4.0
+rush_goal_exit_dist: 0.8
+
+reversal_threshold: 0.9
+reversal_angle_deg: 85.0
+
+lidar_blind_angle_deg: 45.0
+shim_exit_heading_deg: 90.0
+shim_omega: 0.4
+
+obs_search_radius: 5.0
+
+bench_log_enabled: false
+bench_log_period_s: 1.0
+
+enable_startup_scan: false
+
+xy_goal_tolerance: 0.25
+yaw_goal_tolerance: 0.157
+
+odom_frame: odom

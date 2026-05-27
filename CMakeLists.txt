@@ -19,6 +19,9 @@ find_package(catkin REQUIRED COMPONENTS
     pcl_ros
     pcl_conversions
     obstacle_detector
+    nav_core
+    costmap_2d
+    pluginlib
 )
 
 ## Find system dependencies
@@ -85,7 +88,12 @@ catkin_package(
         laser_geometry
         pcl_ros
         pcl_conversions
-        obstacle_detector   
+        obstacle_detector
+        nav_core
+        costmap_2d
+        pluginlib
+    INCLUDE_DIRS include
+    LIBRARIES teamrobo2026_mpc_planner
 )
 
 ###########
@@ -162,14 +170,9 @@ add_dependencies(occupancy_to_cloud_node
     ${catkin_EXPORTED_TARGETS}
 )
 
-# MPC node with ACADOS
+# MPC local planner plugin (ACADOS)
 if(ACADOS_INSTALL_DIR)
-    add_executable(mpc_node 
-        src/mpc_node.cpp
-    )
-    
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/c_generated_code/acados_solver_jackal_diff_drive.c")
-        # Build the ACADOS solver library from source
         add_library(acados_solver_lib STATIC
             c_generated_code/acados_solver_jackal_diff_drive.c
             c_generated_code/acados_sim_solver_jackal_diff_drive.c
@@ -182,28 +185,29 @@ if(ACADOS_INSTALL_DIR)
         target_include_directories(acados_solver_lib PUBLIC
             ${ACADOS_INCLUDE_DIRS}
         )
-        
-        target_link_libraries(mpc_node
-            acados_solver_lib
-            ${catkin_LIBRARIES}
-            ${ACADOS_LIBRARIES}
-            m  # Math library
-        )
+        set_target_properties(acados_solver_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    endif()
+
+    add_library(teamrobo2026_mpc_planner SHARED
+        src/mpc_controller.cpp
+        src/mpc_local_planner_ros.cpp
+    )
+    target_link_libraries(teamrobo2026_mpc_planner
+        ${catkin_LIBRARIES}
+        ${ACADOS_LIBRARIES}
+        m
+    )
+    if(TARGET acados_solver_lib)
+        target_link_libraries(teamrobo2026_mpc_planner acados_solver_lib)
     else()
         message(WARNING "ACADOS generated code not found. Please run generate_acados_solver.py first.")
-        target_link_libraries(mpc_node
-            ${catkin_LIBRARIES}
-            ${ACADOS_LIBRARIES}
-            m  # Math library
-        )
     endif()
-    
-    add_dependencies(mpc_node 
-        ${${PROJECT_NAME}_EXPORTED_TARGETS} 
+    add_dependencies(teamrobo2026_mpc_planner
+        ${${PROJECT_NAME}_EXPORTED_TARGETS}
         ${catkin_EXPORTED_TARGETS}
     )
 else()
-    message(WARNING "ACADOS not configured. MPC node will not be built.")
+    message(WARNING "ACADOS not configured. MPC local planner plugin will not be built.")
 endif()
 
 catkin_install_python(PROGRAMS 
@@ -236,9 +240,13 @@ install(TARGETS
     RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-# Install MPC node if built
-if(TARGET mpc_node)
-    install(TARGETS mpc_node
-        RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+if(TARGET teamrobo2026_mpc_planner)
+    install(TARGETS teamrobo2026_mpc_planner
+        ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
+        RUNTIME DESTINATION ${CATKIN_GLOBAL_BIN_DESTINATION}
+    )
+    install(FILES plugins/mpc_local_planner_plugin.xml
+        DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/plugins
     )
 endif()
