@@ -140,14 +140,14 @@ def setup_acados_ocp():
     ocp.constraints.lbx   = np.array([-2.0, -2.0])
     ocp.constraints.ubx   = np.array([ 2.0,  2.0])
 
-    ocp.constraints.lbu    = np.array([-3.0, -3.0])
-    ocp.constraints.ubu    = np.array([ 3.0,  3.0])
+    ocp.constraints.lbu    = np.array([-2.0, -2.0])
+    ocp.constraints.ubu    = np.array([ 2.0,  2.0])
     ocp.constraints.idxbu  = np.array([0, 1])
 
     v_linear_max = 2.0
     omega_max    = 1.8
-    robot_radius=0.37
-    safety_margin=0.01
+    robot_radius=0.22
+    safety_margin=0.00
     min_dist_sq = (robot_radius + safety_margin)**2
 
     # 14 constraints: v_linear, omega, 12 × distance_sq

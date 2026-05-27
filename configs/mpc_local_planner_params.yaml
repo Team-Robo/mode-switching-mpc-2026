@@ -38,7 +38,7 @@ obs_search_radius: 5.0
 bench_log_enabled: false
 bench_log_period_s: 1.0
 
-enable_startup_scan: false
+enable_startup_scan: true
 
 xy_goal_tolerance: 0.25
 yaw_goal_tolerance: 0.157
