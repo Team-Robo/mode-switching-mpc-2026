@@ -335,6 +335,10 @@ private:
     static constexpr double RECOVERY_V             = -0.3;
     static constexpr double RECOVERY_W             = 0.0;
 
+    std::vector<double> recovery_path_x_;
+    std::vector<double> recovery_path_y_;
+    int                 recovery_path_idx_ = 0;    
+
 };
 
 } // namespace mpc_controller
