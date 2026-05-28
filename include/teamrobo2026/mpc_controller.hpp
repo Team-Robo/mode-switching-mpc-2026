@@ -323,6 +323,18 @@ private:
     double w_opt_ = 0.0;
 
     std::vector<double> reverse_theta_ref_;
+
+    // =========================================================================
+    // Dun Yan: Recovery, in case of consecutive solve failure
+    // =========================================================================
+    int  consecutive_solve_failures_ = 0;
+    int  recovery_ticks_remaining_   = 0;
+    bool recovery_active_            = false;
+    static constexpr int    RECOVERY_TRIGGER_COUNT = 3;
+    static constexpr int    RECOVERY_TICKS         = 15;
+    static constexpr double RECOVERY_V             = -0.3;
+    static constexpr double RECOVERY_W             = 0.0;
+
 };
 
 } // namespace mpc_controller

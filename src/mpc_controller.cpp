@@ -1091,8 +1091,22 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     // 11. SOLVE
     // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
+    // if (status != 0) {
+    //     ROS_WARN("ACADOS solver failed with status %d", status);
+    //     return false;
+    // }
+    
     if (status != 0) {
-        ROS_WARN("ACADOS solver failed with status %d", status);
+        ROS_WARN("ACADOS solver failed (status=%d) — resetting warm start", status);
+        // Poison the warm solution so the next call starts clean
+        double zero_state[5] = {
+            current_state[0], current_state[1], current_state[2], 0.0, 0.0
+        };
+        double zero_u[2] = {0.0, 0.0};
+        for (int i = 0; i <= N_; ++i)
+            ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "x", zero_state);
+        for (int i = 0; i < N_; ++i)
+            ocp_nlp_out_set(nlp_config_, nlp_dims_, nlp_out_, nlp_in_, i, "u", zero_u);
         return false;
     }
     t_after_solve = ros::WallTime::now();
@@ -1343,11 +1357,34 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                                 current_state_, all_obs_x, all_obs_y);
         t_after_solve = ros::WallTime::now();
 
+        // if (success) {
+        //     if (mode_ == ControlMode::ROTATION_SHIM) {
+        //         // Bypass the MPC output entirely — command a direct, steady
+        //         // in-place rotation.  The solver ran to keep the warm solution
+        //         // warm but its output is not used.
+        //         const double shim_w = shim_turn_left_ ? shim_omega_ : -shim_omega_;
+        //         v_opt_ = 0.0;
+        //         w_opt_ = shim_w;
+        //         writeVelocityCommand(0.0, shim_w, cmd_vel);
+        //         ROS_INFO_THROTTLE(0.5, "[ROT_SHIM] spinning %s at w=%.2f rad/s",
+        //                           shim_turn_left_ ? "LEFT" : "RIGHT", shim_w);
+        //     } else {
+        //         writeVelocityCommand(v_opt_, w_opt_, cmd_vel);
+        //         ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f",
+        //                           display_text_.c_str(), v_opt_, w_opt_);
+        //     }
+        // } else {
+        //     v_opt_ = 0.0; w_opt_ = 0.0;
+        //     writeVelocityCommand(0.0, 0.0, cmd_vel);
+        //     ROS_WARN("MPC solve failed — stopping robot");
+        //     return false;
+        // }
+        
+        // Dun Yan: Bottom one is new code with recovery logic, above is old simpler version without recovery
         if (success) {
+            consecutive_solve_failures_ = 0;
+            recovery_active_            = false;
             if (mode_ == ControlMode::ROTATION_SHIM) {
-                // Bypass the MPC output entirely — command a direct, steady
-                // in-place rotation.  The solver ran to keep the warm solution
-                // warm but its output is not used.
                 const double shim_w = shim_turn_left_ ? shim_omega_ : -shim_omega_;
                 v_opt_ = 0.0;
                 w_opt_ = shim_w;
@@ -1361,10 +1398,47 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
             }
         } else {
             v_opt_ = 0.0; w_opt_ = 0.0;
+            consecutive_solve_failures_++;
+            ROS_WARN("MPC solve failed (%d consecutive)", consecutive_solve_failures_);
+
+            // this one uses the original reference path (og_x_ref_, og_y_ref_).
+            if (consecutive_solve_failures_ >= RECOVERY_TRIGGER_COUNT && !recovery_active_) {
+                recovery_active_ = true;
+
+                // Snapshot the already-traversed path in reverse order.
+                // path_progress_idx_ is the current position on og_x_ref_.
+                // Everything before it was driven through collision-free.
+                recovery_path_x_.clear();
+                recovery_path_y_.clear();
+                const int snap_end = std::min(path_progress_idx_,
+                                              static_cast<int>(og_x_ref_.size()) - 1);
+                for (int k = snap_end; k >= 0; --k) {
+                    recovery_path_x_.push_back(og_x_ref_[k]);
+                    recovery_path_y_.push_back(og_y_ref_[k]);
+                }
+                recovery_path_idx_        = 0;
+                recovery_ticks_remaining_ = static_cast<int>(recovery_path_x_.size()) * 3 + 10;
+                ROS_WARN("[RECOVERY] Backtracking along %zu traversed waypoints",
+                         recovery_path_x_.size());
+            }
+
+            // this one does not use the original reference path, it just triggers the recovery mode which will then use the original reference path (og_x_ref_, og_y_ref_) for backtracking
+            // if (consecutive_solve_failures_ >= RECOVERY_TRIGGER_COUNT && !recovery_active_) {
+            //     recovery_active_          = true;
+            //     recovery_ticks_remaining_ = RECOVERY_TICKS;
+            //     ROS_WARN("[RECOVERY] Triggering open-loop backtrack for %d ticks",
+            //              recovery_ticks_remaining_);
+            // }               
+
+            if (recovery_active_ && recovery_ticks_remaining_ > 0) {
+                recovery_ticks_remaining_--;
+                display_text_ = "RECOVERY";
+                writeVelocityCommand(RECOVERY_V, RECOVERY_W, cmd_vel);
+                return true;
+            }
             writeVelocityCommand(0.0, 0.0, cmd_vel);
-            ROS_WARN("MPC solve failed — stopping robot");
             return false;
-        }
+        }     
 
         if (bench_log_enabled_) {
             const auto t_run_end = ros::WallTime::now();
