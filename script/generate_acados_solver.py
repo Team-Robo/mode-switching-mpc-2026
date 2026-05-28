@@ -24,9 +24,6 @@ def export_robot_model():
     vl = SX.sym('vl')  # left wheel velocity
     
     state = vertcat(x, y, theta, vr, vl)
-
-    # State derivative
-    x_dot = SX.sym('x_dot', state.rows())
     
     # Control variables: [ar, al]
     ar = SX.sym('ar')  # right wheel acceleration
@@ -49,16 +46,19 @@ def export_robot_model():
         ar,              # dvr/dt
         al               # dvl/dt
     )
-
-    # Implicit dynamics: f_impl = x_dot - f(x, u)
-    f_impl = x_dot - f_expl
-
+    
+    # State derivative symbolic variable
+    x_dot = SX.sym('x_dot', 5)
+    
     # Distance constraints using parameters — 12 obstacles (2 static + 10 dynamic)
     dist_sq_list = []
     for _k in range(12):
         _px = p[2*_k]
         _py = p[2*_k + 1]
         dist_sq_list.append((x - _px)**2 + (y - _py)**2)
+    
+    # Implicit dynamics: f_impl = x_dot - f(x, u)
+    f_impl = x_dot - f_expl
     
     # Nonlinear constraint expressions: [v_linear, omega, dist_sq_0 .. dist_sq_11]
     h_expr = vertcat(

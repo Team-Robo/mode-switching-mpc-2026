@@ -3,7 +3,7 @@
     <arg name="use_sim_time" default="true" />
     <arg name="gui" default="true" />
     <arg name="headless" default="false" />
-    <arg name="world_name" default="$(find jackal_gazebo)/worlds/jackal_race.world" />
+    <arg name="world_name" default="$(find teamrobo2026)/worlds/obstacles.world" />
 
 
     <!-- Short-term hack to support the original front_laser:=true argument for spawning
@@ -40,6 +40,6 @@
     </include>
 
     <!-- Launch rviz -->
-    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find teamrobo2026)/rviz/jackal.rviz" output="screen"/>
+    <node name="rviz" pkg="rviz" type="rviz" args="-d $(find teamrobo2026)/rviz/mpc.rviz" output="screen"/>
 
 </launch>

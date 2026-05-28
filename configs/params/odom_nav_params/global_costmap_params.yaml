@@ -12,5 +12,5 @@ global_costmap:
   rolling_window: false
 
   inflater_layer:
-    inflation_radius: 0.305
+    inflation_radius: 0.2
     cost_scaling_factor: 7.688353497010365

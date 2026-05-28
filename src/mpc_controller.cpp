@@ -1,6 +1,7 @@
-#include "mpc_node.hpp"
+#include <teamrobo2026/mpc_controller.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
+#include <tf2/utils.h>
 #include <algorithm>
 #include <limits>
 #include <pcl/point_types.h>
@@ -24,7 +25,7 @@ inline void normalize2D(double& x, double& y) {
 }
 }  // namespace
 
-MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
+MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private)
 {
     nh_private_.param<double>("v_linear_max",      v_linear_max_,      2.0);
@@ -68,6 +69,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("rush_weight_accel",    rush_weight_accel_,    0.0);
     nh_private_.param<double>("rush_vref",            rush_vref_,            2.0);
 
+    nh_private_.param<bool>("enable_startup_scan", enable_startup_scan_, true);
+
     // Dynamic obstacle hysteresis timeout
     nh_private_.param<double>("dynamic_obs_timeout", dynamic_obs_timeout_, 0.35);
 
@@ -83,6 +86,8 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
 
     ROS_INFO("=== MPC Node Parameters ===");
+    ROS_INFO("  Startup scan: %s (fixed sweep ±45° / 90° @ %.1f rad/s)",
+            enable_startup_scan_ ? "ENABLED" : "disabled", STARTUP_SCAN_OMEGA);
     ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
              v_linear_max_, v_static_obs_max_, omega_max_);
     ROS_INFO("  Weights: pos=%.2f  heading=%.2f  accel=%.4f  velocity=%.2f",
@@ -107,17 +112,14 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("  Bench logging: enabled=%s  period=%.2f s",
              bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
 
-    pub_vel_      = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 10, true);
     pub_mpc_plan_ = nh_.advertise<nav_msgs::Path>("/mpc_plan", 1);
     pub_marker_   = nh_.advertise<visualization_msgs::Marker>("/mode", 1);
 
-    sub_odom_       = nh_.subscribe("/odometry/filtered", 1, &MPCNode::callbackOdom, this);
-    sub_global_plan_= nh_.subscribe("/move_base/TrajectoryPlannerROS/global_plan", 1,
-                                    &MPCNode::callbackGlobalPlan, this);
-    sub_cloud_      = nh_.subscribe("/front/odom/cloud", 1, &MPCNode::callbackCloud, this);
-    sub_map_cloud_  = nh_.subscribe("/map/cloud", 1, &MPCNode::callbackMapCloud, this);
+    sub_odom_       = nh_.subscribe("/odometry/filtered", 1, &MpcController::callbackOdom, this);
+    sub_cloud_      = nh_.subscribe("/front/odom/cloud", 1, &MpcController::callbackCloud, this);
+    sub_map_cloud_  = nh_.subscribe("/map/cloud", 1, &MpcController::callbackMapCloud, this);
     //sub_dynamic_obstacle_ = nh_.subscribe("/obstacles", 10,
-    //                                      &MPCNode::callbackTrackDynamicObstacle, this);
+    //                                      &MpcController::callbackTrackDynamicObstacle, this);
 
     current_state_.resize(nx_, 0.0);
 
@@ -129,23 +131,24 @@ MPCNode::MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("MPC Node initialized with ACADOS solver");
 }
 
-MPCNode::~MPCNode() {
+MpcController::~MpcController() {
     cleanupAcadosSolver();
 }
 
-void MPCNode::initializeAcadosSolver() {
+void MpcController::initializeAcadosSolver() {
     acados_ocp_capsule_ = jackal_diff_drive_acados_create_capsule();
     if (acados_ocp_capsule_ == nullptr) {
-        ROS_FATAL("ACADOS capsule allocation returned null — shutting down");
-        ros::shutdown();
+        ROS_ERROR("ACADOS capsule allocation returned null");
+        solver_ready_ = false;
         return;
     }
     int status = jackal_diff_drive_acados_create(acados_ocp_capsule_);
     if (status != 0) {
-        ROS_FATAL("Failed to create ACADOS solver (status=%d) — shutting down", status);
-        ros::shutdown();
+        ROS_ERROR("Failed to create ACADOS solver (status=%d)", status);
+        solver_ready_ = false;
         return;
     }
+    solver_ready_ = true;
     nlp_config_ = jackal_diff_drive_acados_get_nlp_config(acados_ocp_capsule_);
     nlp_dims_   = jackal_diff_drive_acados_get_nlp_dims(acados_ocp_capsule_);
     nlp_in_     = jackal_diff_drive_acados_get_nlp_in(acados_ocp_capsule_);
@@ -155,7 +158,7 @@ void MPCNode::initializeAcadosSolver() {
     ROS_INFO("ACADOS solver created successfully");
 }
 
-void MPCNode::cleanupAcadosSolver() {
+void MpcController::cleanupAcadosSolver() {
     if (acados_ocp_capsule_ != nullptr) {
         if (jackal_diff_drive_acados_free(acados_ocp_capsule_) != 0)
             ROS_WARN("Failed to free ACADOS solver");
@@ -167,7 +170,7 @@ void MPCNode::cleanupAcadosSolver() {
 // =============================================================================
 // Callbacks
 // =============================================================================
-void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
+void MpcController::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     double yaw = quaternionToYaw(msg->pose.pose.orientation);
     double v   = msg->twist.twist.linear.x;
     double w   = msg->twist.twist.angular.z;
@@ -179,23 +182,17 @@ void MPCNode::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
     publishMarker();
 }
 
-void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
-    if (msg->poses.empty()) return;
-    og_x_ref_.clear(); og_y_ref_.clear(); theta_ref_.clear();
-    
-    // Reset progress index for new plan
+void MpcController::ingestGlobalPlan(const std::vector<double>& xs, const std::vector<double>& ys) {
+    if (xs.empty() || xs.size() != ys.size()) return;
+    og_x_ref_ = xs;
+    og_y_ref_ = ys;
+    theta_ref_.clear();
     path_progress_idx_ = 0;
 
-    int skip = (msg->poses.size() <= 2 * (N_ + 5)) ? 1 : 2;
-
-    for (size_t i = 0; i < msg->poses.size(); i += skip) {
-        og_x_ref_.push_back(msg->poses[i].pose.position.x);
-        og_y_ref_.push_back(msg->poses[i].pose.position.y);
-    }
     double center_heading = current_state_[2];
     for (size_t i = 0; i < og_x_ref_.size() - 1; ++i) {
-        double dx = og_x_ref_[i+1] - og_x_ref_[i];
-        double dy = og_y_ref_[i+1] - og_y_ref_[i];
+        double dx = og_x_ref_[i + 1] - og_x_ref_[i];
+        double dy = og_y_ref_[i + 1] - og_y_ref_[i];
         double theta_proc = headingPreprocess(center_heading, std::atan2(dy, dx));
         if (i == 0) theta_ref_.push_back(theta_proc);
         theta_ref_.push_back(theta_proc);
@@ -203,7 +200,60 @@ void MPCNode::callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg) {
     }
 }
 
-void MPCNode::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+bool MpcController::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan,
+                            tf2_ros::Buffer* tf) {
+    if (plan.empty() || tf == nullptr) return false;
+
+    std::vector<double> xs, ys;
+    const int skip = (plan.size() <= static_cast<size_t>(2 * (N_ + 5))) ? 1 : 2;
+
+    for (size_t i = 0; i < plan.size(); i += static_cast<size_t>(skip)) {
+        geometry_msgs::PoseStamped in = plan[i];
+        geometry_msgs::PoseStamped out;
+        try {
+            if (in.header.frame_id.empty()) {
+                ROS_WARN_THROTTLE(2.0, "setPlan: pose has empty frame_id");
+                return false;
+            }
+            if (in.header.frame_id == odom_frame_) {
+                out = in;
+            } else {
+                out = tf->transform(in, odom_frame_, ros::Duration(0.2));
+            }
+        } catch (const tf2::TransformException& ex) {
+            ROS_WARN_THROTTLE(2.0, "setPlan TF: %s", ex.what());
+            return false;
+        }
+        xs.push_back(out.pose.position.x);
+        ys.push_back(out.pose.position.y);
+    }
+
+    ingestGlobalPlan(xs, ys);
+    return !og_x_ref_.empty();
+}
+
+void MpcController::updateRobotPose(const geometry_msgs::PoseStamped& pose) {
+    current_state_[0] = pose.pose.position.x;
+    current_state_[1] = pose.pose.position.y;
+    current_state_[2] = quaternionToYaw(pose.pose.orientation);
+}
+
+bool MpcController::isGoalReached(double xy_tolerance, double yaw_tolerance) const {
+    if (og_x_ref_.empty() || current_state_.size() < 3) return false;
+    const double gx = og_x_ref_.back();
+    const double gy = og_y_ref_.back();
+    const double dx = gx - current_state_[0];
+    const double dy = gy - current_state_[1];
+    const double dist = std::sqrt(dx * dx + dy * dy);
+    if (dist > xy_tolerance) return false;
+
+    if (theta_ref_.empty()) return true;
+    const double goal_yaw = theta_ref_.back();
+    const double yaw_err = std::abs(diffAngle(current_state_[2], goal_yaw));
+    return yaw_err <= yaw_tolerance;
+}
+
+void MpcController::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     obs_x_.clear(); obs_y_.clear();
     sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y");
     for (; ix != ix.end(); ++ix, ++iy) {
@@ -212,7 +262,7 @@ void MPCNode::callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     }
 }
 
-void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+void MpcController::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     map_x_.clear(); map_y_.clear();
     sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y");
     for (; ix != ix.end(); ++ix, ++iy) {
@@ -221,7 +271,7 @@ void MPCNode::callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
     }
 }
 
-void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg) {
+void MpcController::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg) {
     dynamic_obstacles_.clear();
     for (const auto& circle : msg->circles) {
         DynamicObstacle obs;
@@ -235,28 +285,28 @@ void MPCNode::callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::C
 // =============================================================================
 // Utility
 // =============================================================================
-double MPCNode::quaternionToYaw(const geometry_msgs::Quaternion& q) {
+double MpcController::quaternionToYaw(const geometry_msgs::Quaternion& q) {
     return std::atan2(2.0*(q.z*q.w + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z));
 }
 
-double MPCNode::headingPreprocess(double center, double target) const {
+double MpcController::headingPreprocess(double center, double target) const {
     while (target < center - M_PI) target += 2.0 * M_PI;
     while (target > center + M_PI) target -= 2.0 * M_PI;
     return target;
 }
 
-double MPCNode::diffAngle(double a1, double a2) const {
+double MpcController::diffAngle(double a1, double a2) const {
     double diff = std::fabs(a1 - a2);
     if (diff > M_PI) diff = 2.0 * M_PI - diff;
     return diff;
 }
 
-bool MPCNode::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
+bool MpcController::isLeft(double rx, double ry, double rtheta, double ox, double oy) const {
     double dx = ox - rx, dy = oy - ry;
     return (-std::sin(rtheta)*dx + std::cos(rtheta)*dy) > 0;
 }
 
-bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta) {
+bool MpcController::checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta) {
     if (theta_ref.empty()) return false;
     int count  = 0;
     int length = std::min(static_cast<int>(theta_ref.size()), N_);
@@ -266,7 +316,7 @@ bool MPCNode::checkReversalNeeded(const std::vector<double>& theta_ref, double c
     return (static_cast<double>(count) / length) > reversal_threshold_;
 }
 
-std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x_ref,
+std::vector<double> MpcController::computeReverseThetaRef(const std::vector<double>& x_ref,
                                                      const std::vector<double>& y_ref,
                                                      double current_theta) {
     std::vector<double> rev;
@@ -284,7 +334,7 @@ std::vector<double> MPCNode::computeReverseThetaRef(const std::vector<double>& x
 // =============================================================================
 // ROTATION_SHIM helper
 // =============================================================================
-bool MPCNode::isGoalInBlindSpot(double robot_theta,
+bool MpcController::isGoalInBlindSpot(double robot_theta,
                                 double goal_x, double goal_y,
                                 double robot_x, double robot_y) const
 {
@@ -300,7 +350,7 @@ bool MPCNode::isGoalInBlindSpot(double robot_theta,
     return (diff < blind_half);
 }
 
-void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
+void MpcController::findClosestPoint(const std::vector<double>& x_ref,
                                const std::vector<double>& y_ref,
                                double curr_x, double curr_y, int& min_idx) {
     double min_dist = std::numeric_limits<double>::max();
@@ -313,7 +363,7 @@ void MPCNode::findClosestPoint(const std::vector<double>& x_ref,
     path_progress_idx_ = min_idx;
 }
 
-std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
+std::vector<PredictedObstacle> MpcController::predictObstaclesTrajectory(
     const std::vector<DynamicObstacle>& obstacles, double dt, int N)
 {
     std::vector<PredictedObstacle> preds;
@@ -333,7 +383,7 @@ std::vector<PredictedObstacle> MPCNode::predictObstaclesTrajectory(
     return preds;
 }
 
-void MPCNode::applyDynamicBehaviorPlanning(
+void MpcController::applyDynamicBehaviorPlanning(
     std::vector<double>& x_ref,
     std::vector<double>& y_ref,
     const std::vector<PredictedObstacle>& predicted_obstacles,
@@ -433,7 +483,7 @@ void MPCNode::applyDynamicBehaviorPlanning(
     y_ref.swap(shifted_y);
 }
 
-std::vector<double> MPCNode::buildHeadingRefFromPath(
+std::vector<double> MpcController::buildHeadingRefFromPath(
     const std::vector<double>& x_ref,
     const std::vector<double>& y_ref,
     double current_heading) const
@@ -464,14 +514,14 @@ std::vector<double> MPCNode::buildHeadingRefFromPath(
 // =============================================================================
 // RUSH_GOAL helpers
 // =============================================================================
-double MPCNode::distToGoal(double rx, double ry) const {
+double MpcController::distToGoal(double rx, double ry) const {
     if (og_x_ref_.empty()) return std::numeric_limits<double>::max();
     double dx = og_x_ref_.back() - rx;
     double dy = og_y_ref_.back() - ry;
     return std::sqrt(dx*dx + dy*dy);
 }
 
-void MPCNode::warmStartFromCurrentState(const std::vector<double>& current_state) {
+void MpcController::warmStartFromCurrentState(const std::vector<double>& current_state) {
     constexpr double Tf = 2.0;
     double dt = Tf / N_;
 
@@ -508,15 +558,15 @@ void MPCNode::warmStartFromCurrentState(const std::vector<double>& current_state
 }
 
 // =============================================================================
-// selectObstacles — 2 closest static + up to 10 dynamic obstacles
+// selectObstacles — nearest left/right static + up to 10 dynamic obstacles
 //   p_data layout: [x0,y0, x1,y1,   x2,y2, ..., x11,y11]
-//                   ^---static---^   ^-------dynamic-------^
+//                   ^left ^right     ^-------dynamic-------^
 // =============================================================================
-void MPCNode::selectObstacles(
+void MpcController::selectObstacles(
     const std::vector<double>& obs_x,
     const std::vector<double>& obs_y,
     const std::vector<PredictedObstacle>& predicted_obstacles,
-    double rx, double ry,
+    double rx, double ry, double rtheta,
     int stage,
     double search_radius_sq,
     double p_data[24]) const
@@ -524,29 +574,37 @@ void MPCNode::selectObstacles(
     constexpr int N_STATIC  = 2;
     constexpr int N_DYNAMIC = 10;
 
-    // --- 2 closest static obstacles ---
-    struct StaticCand { double x, y, dist_sq; };
-    std::vector<StaticCand> static_cands;
-    static_cands.reserve(obs_x.size());
+    // --- nearest static on left and right (robot frame via isLeft) ---
+    double left_dist_sq  = std::numeric_limits<double>::infinity();
+    double right_dist_sq = std::numeric_limits<double>::infinity();
+    double left_x  = 1000.0, left_y  = 1000.0;
+    double right_x = 1000.0, right_y = 1000.0;
+
     for (size_t j = 0; j < obs_x.size(); ++j) {
-        double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
-        double d2 = dx*dx + dy*dy;
+        const double dx = obs_x[j] - rx;
+        const double dy = obs_y[j] - ry;
+        const double d2 = dx * dx + dy * dy;
         if (d2 > search_radius_sq) continue;
-        static_cands.push_back({obs_x[j], obs_y[j], d2});
-    }
-    std::partial_sort(static_cands.begin(),
-                      static_cands.begin() + std::min((int)static_cands.size(), N_STATIC),
-                      static_cands.end(),
-                      [](const StaticCand& a, const StaticCand& b){ return a.dist_sq < b.dist_sq; });
-    for (int k = 0; k < N_STATIC; ++k) {
-        if (k < (int)static_cands.size()) {
-            p_data[2*k+0] = static_cands[k].x;
-            p_data[2*k+1] = static_cands[k].y;
+
+        if (isLeft(rx, ry, rtheta, obs_x[j], obs_y[j])) {
+            if (d2 < left_dist_sq) {
+                left_dist_sq = d2;
+                left_x = obs_x[j];
+                left_y = obs_y[j];
+            }
         } else {
-            p_data[2*k+0] = 1000.0;
-            p_data[2*k+1] = 1000.0;
+            if (d2 < right_dist_sq) {
+                right_dist_sq = d2;
+                right_x = obs_x[j];
+                right_y = obs_y[j];
+            }
         }
     }
+
+    p_data[0] = left_x;
+    p_data[1] = left_y;
+    p_data[2] = right_x;
+    p_data[3] = right_y;
 
     // --- up to 10 dynamic obstacles (sorted by effective distance) ---
     struct DynCand { double x, y, eff_dist; };
@@ -579,7 +637,7 @@ void MPCNode::selectObstacles(
 // =============================================================================
 // checkEmergencyStop
 // =============================================================================
-bool MPCNode::checkEmergencyStop(
+bool MpcController::checkEmergencyStop(
     const std::vector<PredictedObstacle>& predicted_obstacles,
     const std::vector<double>& current_state) const
 {
@@ -607,7 +665,7 @@ bool MPCNode::checkEmergencyStop(
 // =============================================================================
 // OCP Solver
 // =============================================================================
-bool MPCNode::solveOCP(const std::vector<double>& x_ref,
+bool MpcController::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& y_ref,
                        const std::vector<double>& theta_ref,
                        const std::vector<double>& current_state,
@@ -743,77 +801,49 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
         ROS_INFO_THROTTLE(2.0, "Mode: NORMAL");
     }
 
-    // =========================================================================
-    // 4b. ROTATION_SHIM — evaluated after primary mode, overrides everything
-    //     except DYNAMIC_OBS (a moving obstacle trumps a blind-spot spin).
-    //
-    //     Triggers when a reversal is needed AND the goal direction falls inside
-    //     the lidar blind zone.  The robot spins in place until the goal clears
-    //     the blind zone edge (plus shim_exit_heading_deg_ buffer), then this
-    //     mode releases and normal reversal takes over.
-    // =========================================================================
+    // =====================================================================
+    // 4b. ROTATION_SHIM — overrides all non-DYNAMIC_OBS modes whenever the
+    //     robot heading is too far off the path heading.
+    // =====================================================================
     if (mode_ != ControlMode::DYNAMIC_OBS) {
-        bool reversal_pending = checkReversalNeeded(theta_ref, current_state[2]);
+        // Angular error from robot heading to first meaningful path heading.
+        // theta_ref is the forward path heading — during reversal this will
+        // naturally be ~180° off, so reversal is covered automatically.
+        const double path_heading = (theta_ref.size() > 1) ? theta_ref[1] : 
+                                    (!theta_ref.empty() ? theta_ref[0] : current_state[2]);
+        double angular_err = path_heading - current_state[2];
+        while (angular_err >  M_PI) angular_err -= 2.0 * M_PI;
+        while (angular_err < -M_PI) angular_err += 2.0 * M_PI;
 
-        if (reversal_pending && !og_x_ref_.empty()) {
-            double gx = og_x_ref_.back();
-            double gy = og_y_ref_.back();
-            bool in_blind = isGoalInBlindSpot(current_state[2], gx, gy,
-                                              current_state[0], current_state[1]);
+        // shim_exit_heading_deg_ reused as the ENGAGE threshold (e.g. 90°).
+        // Disengage at half to avoid chattering at the boundary.
+        const double engage_rad    = shim_exit_heading_deg_ * M_PI / 180.0;
+        const double disengage_rad = engage_rad * 0.5;
 
-            // Entry: latch the shim ON and choose spin direction once.
-            if (!shim_active_ && in_blind) {
-                shim_active_ = true;
-
-                // Rotate toward whichever side brings the goal into the FOV
-                // faster — use the cross product to find which side the goal is on.
-                double dx = gx - current_state[0];
-                double dy = gy - current_state[1];
-                // Cross product z-component: positive → goal is left of heading
-                double cross = std::cos(current_state[2]) * dy
-                             - std::sin(current_state[2]) * dx;
-                shim_turn_left_ = (cross > 0.0);
-                ROS_INFO("ROTATION_SHIM engaged — turning %s (goal in blind spot)",
-                         shim_turn_left_ ? "LEFT" : "RIGHT");
-            }
-
-            // Exit: use shim_exit_heading_deg_ as an angular buffer so the goal
-            // must be clearly inside the FOV before we release (avoids chattering
-            // at the blind-zone boundary).
-            if (shim_active_) {
-                double dx = gx - current_state[0];
-                double dy = gy - current_state[1];
-                double angle_to_goal = std::atan2(dy, dx);
-                double rear_dir = current_state[2] + M_PI;
-                double diff_from_rear = diffAngle(angle_to_goal, rear_dir);
-                double clear_angle = lidar_blind_angle_deg_ * M_PI / 180.0
-                                   + shim_exit_heading_deg_ * M_PI / 180.0;
-                if (diff_from_rear >= clear_angle) {
-                    shim_active_ = false;
-                    ROS_INFO("ROTATION_SHIM released — goal now %.1f deg from rear (need >= %.1f deg)",
-                             diff_from_rear * 180.0 / M_PI, clear_angle * 180.0 / M_PI);
-                }
-            }
-        } else {
-            // No reversal needed — always clear the shim.
-            if (shim_active_) {
-                shim_active_ = false;
-                ROS_INFO("ROTATION_SHIM cleared (no reversal needed)");
-            }
+        if (!shim_active_ && std::fabs(angular_err) > engage_rad) {
+            shim_active_    = true;
+            shim_turn_left_ = (angular_err > 0.0);
+            ROS_INFO("ROTATION_SHIM ON: err=%.1f deg → turning %s",
+                    angular_err * 180.0 / M_PI, shim_turn_left_ ? "LEFT" : "RIGHT");
+        }
+        if (shim_active_ && std::fabs(angular_err) < disengage_rad) {
+            shim_active_ = false;
+            ROS_INFO("ROTATION_SHIM OFF: aligned to %.1f deg (< %.1f deg threshold)",
+                    std::fabs(angular_err) * 180.0 / M_PI,
+                    disengage_rad * 180.0 / M_PI);
         }
 
         if (shim_active_) {
             mode_         = ControlMode::ROTATION_SHIM;
             display_text_ = "ROT_SHIM";
-            ROS_INFO_THROTTLE(0.5, "Mode: ROTATION_SHIM (spinning %s)",
-                              shim_turn_left_ ? "LEFT" : "RIGHT");
+            ROS_INFO_THROTTLE(0.5, "ROTATION_SHIM: spinning %s (err=%.1f deg)",
+                            shim_turn_left_ ? "LEFT" : "RIGHT",
+                            angular_err * 180.0 / M_PI);
         }
     } else {
-        // Dynamic obstacle active — disengage shim so it re-evaluates cleanly
-        // once the dynamic obstacle clears.
+        // Dynamic obstacle clears the shim so it re-evaluates once it clears.
         shim_active_ = false;
     }
-    t_after_mode = ros::WallTime::now();
 
     // =========================================================================
     // 4c. ROTATION_SHIM EARLY-EXIT — bypass the ACADOS solver completely.
@@ -1056,8 +1086,9 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
                     local_obs_y.push_back(cloud->points[idx].y);
                 }
             }
+            const double pred_theta = (i == 0) ? current_state[2] : st;
             selectObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
-                            pred_x, pred_y,
+                            pred_x, pred_y, pred_theta,
                             i, search_radius_sq, p_data);
         }
 
@@ -1108,16 +1139,88 @@ bool MPCNode::solveOCP(const std::vector<double>& x_ref,
 }
 
 // =============================================================================
-// Publishers
+// Startup Symmetrical Scan
+//   Phase sequence:  IDLE → SCAN_LEFT (+45°) → SCAN_RIGHT (−90°) → SCAN_CENTER (+45°) → DONE
+//   Fixed speed: STARTUP_SCAN_OMEGA rad/s.  All angles hard-coded.
 // =============================================================================
-void MPCNode::publishVelocity(double v, double w) {
-    geometry_msgs::Twist msg;
-    msg.linear.x  = v;
-    msg.angular.z = w;
-    pub_vel_.publish(msg);
+bool MpcController::runStartupScan(geometry_msgs::Twist& cmd_vel)
+{
+    const double yaw = current_state_[2];
+    auto signed_delta = [](double from, double to) -> double {
+        double d = to - from;
+        while (d >  M_PI) d -= 2.0 * M_PI;
+        while (d < -M_PI) d += 2.0 * M_PI;
+        return d;
+    };
+
+    // start yaw, begin left sweep 
+    if (startup_scan_phase_ == StartupScanPhase::IDLE) {
+        startup_scan_start_yaw_ = yaw;
+        startup_scan_phase_     = StartupScanPhase::SCAN_LEFT;
+        mode_         = ControlMode::ROTATION_SHIM;   // borrow shim colour
+        display_text_ = "SCAN_L";
+        ROS_INFO("[StartupScan] BEGIN — rotating LEFT 45°");
+    }
+
+    // rotate CCW until +45° accumulated 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_LEFT) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) < STARTUP_SCAN_STEP) {
+            writeVelocityCommand(0.0, STARTUP_SCAN_OMEGA, cmd_vel);
+        } else {
+            writeVelocityCommand(0.0, 0.0, cmd_vel);
+            startup_scan_start_yaw_ = yaw;
+            startup_scan_phase_     = StartupScanPhase::SCAN_RIGHT;
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "SCAN_R";
+            ROS_INFO("[StartupScan] LEFT done — rotating RIGHT 90°");
+        }
+        return true;
+    }
+
+    // rotate CW until −90° accumulated 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_RIGHT) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) > -2.0 * STARTUP_SCAN_STEP) {
+            writeVelocityCommand(0.0, -STARTUP_SCAN_OMEGA, cmd_vel);
+        } else {
+            writeVelocityCommand(0.0, 0.0, cmd_vel);
+            startup_scan_start_yaw_ = yaw;
+            startup_scan_phase_     = StartupScanPhase::SCAN_CENTER;
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "SCAN_C";
+            ROS_INFO("[StartupScan] RIGHT done — returning to center (+45°)");
+        }
+        return true;
+    }
+
+    // rotate CCW until +45° accumulated (back to origin) 
+    if (startup_scan_phase_ == StartupScanPhase::SCAN_CENTER) {
+        if (signed_delta(startup_scan_start_yaw_, yaw) < STARTUP_SCAN_STEP) {
+            writeVelocityCommand(0.0, STARTUP_SCAN_OMEGA, cmd_vel);
+        } else {
+            writeVelocityCommand(0.0, 0.0, cmd_vel);
+            startup_scan_phase_ = StartupScanPhase::DONE;
+            startup_scan_done_  = true;
+            mode_         = ControlMode::NORMAL;
+            display_text_ = "NORMAL";
+            ROS_INFO("[StartupScan] COMPLETE — resuming normal MPC operation");
+        }
+        return true;
+    }
+
+    // DONE guard (shouldn't normally be reached)
+    startup_scan_done_ = true;
+    return true;
 }
 
-void MPCNode::publishTrajectory(const std::vector<double>& x_traj,
+// =============================================================================
+// Publishers
+// =============================================================================
+void MpcController::writeVelocityCommand(double v, double w, geometry_msgs::Twist& cmd_vel) const {
+    cmd_vel.linear.x  = v;
+    cmd_vel.angular.z = w;
+}
+
+void MpcController::publishTrajectory(const std::vector<double>& x_traj,
                                 const std::vector<double>& y_traj) {
     nav_msgs::Path path;
     path.header.stamp    = ros::Time::now();
@@ -1132,7 +1235,7 @@ void MPCNode::publishTrajectory(const std::vector<double>& x_traj,
     pub_mpc_plan_.publish(path);
 }
 
-void MPCNode::publishMarker() {
+void MpcController::publishMarker() {
     visualization_msgs::Marker m;
     m.header.frame_id = odom_frame_;
     m.header.stamp    = ros::Time::now();
@@ -1171,10 +1274,17 @@ void MPCNode::publishMarker() {
 // =============================================================================
 // Main loop
 // =============================================================================
-void MPCNode::run() {
-    if (nlp_config_ == nullptr) {
-        ROS_ERROR_THROTTLE(5.0, "ACADOS solver not initialized — skipping run()");
-        return;
+bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
+    cmd_vel = geometry_msgs::Twist();
+    if (!solver_ready_ || nlp_config_ == nullptr) {
+        ROS_ERROR_THROTTLE(5.0, "ACADOS solver not initialized");
+        return false;
+    }
+    if (og_x_ref_.empty() || og_y_ref_.empty()) {
+        return false;
+    }
+    if (enable_startup_scan_ && !startup_scan_done_) {
+        return runStartupScan(cmd_vel);
     }
     try {
         const auto t_run_start = ros::WallTime::now();
@@ -1182,7 +1292,7 @@ void MPCNode::run() {
         ros::WallTime t_after_theta_obs = t_run_start;
         ros::WallTime t_after_solve = t_run_start;
 
-        if (og_x_ref_.empty() || theta_ref_.empty()) return;
+        if (og_x_ref_.empty() || theta_ref_.empty()) return false;
 
         int min_idx = 0;
         findClosestPoint(og_x_ref_, og_y_ref_, current_state_[0], current_state_[1], min_idx);
@@ -1209,7 +1319,7 @@ void MPCNode::run() {
                 last_y = og_y_ref_[i];
             }
         }
-        if (x_ref_.empty()) { publishVelocity(0.0, 0.0); return; }
+        if (x_ref_.empty()) { writeVelocityCommand(0.0, 0.0, cmd_vel); return false; }
 
         double gx = x_ref_.back(), gy = y_ref_.back();
         while (x_ref_.size() <= static_cast<size_t>(N_)) {
@@ -1227,8 +1337,8 @@ void MPCNode::run() {
         while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
             theta_sub.push_back(theta_sub.back());
         if (theta_sub.empty()) {
-            publishVelocity(0.0, 0.0);
-            return;
+            writeVelocityCommand(0.0, 0.0, cmd_vel);
+            return false;
         }
 
         std::vector<double> all_obs_x, all_obs_y;
@@ -1250,18 +1360,19 @@ void MPCNode::run() {
                 const double shim_w = shim_turn_left_ ? shim_omega_ : -shim_omega_;
                 v_opt_ = 0.0;
                 w_opt_ = shim_w;
-                publishVelocity(0.0, shim_w);
+                writeVelocityCommand(0.0, shim_w, cmd_vel);
                 ROS_INFO_THROTTLE(0.5, "[ROT_SHIM] spinning %s at w=%.2f rad/s",
                                   shim_turn_left_ ? "LEFT" : "RIGHT", shim_w);
             } else {
-                publishVelocity(v_opt_, w_opt_);
+                writeVelocityCommand(v_opt_, w_opt_, cmd_vel);
                 ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f",
                                   display_text_.c_str(), v_opt_, w_opt_);
             }
         } else {
             v_opt_ = 0.0; w_opt_ = 0.0;
-            publishVelocity(0.0, 0.0);
+            writeVelocityCommand(0.0, 0.0, cmd_vel);
             ROS_WARN("MPC solve failed — stopping robot");
+            return false;
         }
 
         if (bench_log_enabled_) {
@@ -1275,31 +1386,12 @@ void MPCNode::run() {
                 << " | obs_counts(laser,map,dyn)="
                 << obs_x_.size() << "," << map_x_.size() << "," << dynamic_obstacles_.size());
         }
+        return true;
     } catch (const std::exception& e) {
-        ROS_ERROR("Exception in MPC run: %s", e.what());
-        publishVelocity(0.0, 0.0);
+        ROS_ERROR("Exception in MPC runOnce: %s", e.what());
+        writeVelocityCommand(0.0, 0.0, cmd_vel);
+        return false;
     }
 }
 
 } // namespace mpc_controller
-
-// =============================================================================
-// main
-// =============================================================================
-int main(int argc, char** argv) {
-    ros::init(argc, argv, "nmpc");
-    ros::NodeHandle nh;
-    ros::NodeHandle nh_private("~");
-    mpc_controller::MPCNode mpc_node(nh, nh_private);
-    double mpc_rate = 30.0;
-    nh_private.param<double>("mpc_rate", mpc_rate, 25.0);
-    ros::Rate rate(mpc_rate);
-    ros::Duration(1.0).sleep();
-    ROS_INFO("Non-Linear MPC Node running at %.1f Hz", mpc_rate);
-    while (ros::ok()) {
-        ros::spinOnce();
-        mpc_node.run();
-        rate.sleep();
-    }
-    return 0;
-}

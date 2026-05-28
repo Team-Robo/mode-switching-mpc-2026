@@ -1,12 +1,13 @@
-#ifndef MPC_NODE_HPP
-#define MPC_NODE_HPP
-// mpc_node.hpp
+#ifndef MPC_CONTROLLER_HPP
+#define MPC_CONTROLLER_HPP
+// mpc_controller.hpp
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <tf2_ros/buffer.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/Marker.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
@@ -41,10 +42,19 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
+enum class StartupScanPhase {
+    IDLE,
+    SCAN_LEFT,    // rotate CCW 45°
+    SCAN_RIGHT,   // rotate CW  90°
+    SCAN_CENTER,  // rotate CCW 45° back to origin
+    DONE
+};
+
 // Priority: DYNAMIC_OBS > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
 // ROTATION_SHIM fires when a reversal is needed but the goal direction falls
 // inside the lidar blind zone — the robot spins in place until the goal is
 // visible, then hands off to normal reversal.
+
 enum class ControlMode {
     NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
     STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
@@ -55,35 +65,47 @@ enum class ControlMode {
                      // rotation until goal enters FOV, then releases to reversal
 };
 
-class MPCNode {
+class MpcController {
 public:
-    MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private);
-    ~MPCNode();
+    MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private);
+    ~MpcController();
 
-    void run();
+    /** One control cycle: fills cmd_vel and returns false if no valid command. */
+    bool runOnce(geometry_msgs::Twist& cmd_vel);
+
+    /** Global plan from move_base (transformed into odom_frame_). */
+    bool setPlan(const std::vector<geometry_msgs::PoseStamped>& plan, tf2_ros::Buffer* tf);
+
+    bool isGoalReached(double xy_tolerance, double yaw_tolerance) const;
+
+    bool solverReady() const { return solver_ready_; }
+
+    void updateRobotPose(const geometry_msgs::PoseStamped& pose);
 
 private:
     ros::NodeHandle nh_;
     ros::NodeHandle nh_private_;
 
-    // Publishers
-    ros::Publisher pub_vel_;
+    // Publishers (debug)
     ros::Publisher pub_mpc_plan_;
     ros::Publisher pub_marker_;
 
     // Subscribers
     ros::Subscriber sub_odom_;
-    ros::Subscriber sub_global_plan_;
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     ros::Subscriber sub_dynamic_obstacle_;
 
+    bool solver_ready_ = false;
+
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
-    void callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg);
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
+
+    void ingestGlobalPlan(const std::vector<double>& xs, const std::vector<double>& ys);
+    void writeVelocityCommand(double v, double w, geometry_msgs::Twist& cmd_vel) const;
 
     // ACADOS
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -104,10 +126,10 @@ private:
                   const std::vector<double>& obs_x,
                   const std::vector<double>& obs_y);
 
-    void publishVelocity(double v, double w);
     void publishTrajectory(const std::vector<double>& x_traj,
                            const std::vector<double>& y_traj);
     void publishMarker();
+    bool runStartupScan(geometry_msgs::Twist& cmd_vel);
 
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
@@ -116,7 +138,7 @@ private:
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
                             double curr_x, double curr_y, int& min_idx);
-    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy);
+    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy) const;
 
     // Reversal
     bool checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta);
@@ -143,13 +165,13 @@ private:
         double current_heading) const;
 
     // =========================================================================
-    // Obstacle selection — 2 closest static + up to 10 dynamic (24 params)
+    // Obstacle selection — nearest left/right static + up to 10 dynamic (24 params)
     // =========================================================================
     void selectObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
         const std::vector<PredictedObstacle>& predicted_obstacles,
-        double rx, double ry,
+        double rx, double ry, double rtheta,
         int stage,
         double search_radius_sq,
         double p_data[24]) const;
@@ -274,6 +296,14 @@ private:
     double dyn_plan_max_lateral_shift_ = 1.2;
     double dyn_plan_smoothing_ = 0.35;
 
+    bool               enable_startup_scan_   = false;
+    bool               startup_scan_done_     = false;
+    StartupScanPhase   startup_scan_phase_    = StartupScanPhase::IDLE;
+    double             startup_scan_start_yaw_ = 0.0;
+
+    static constexpr double STARTUP_SCAN_OMEGA = 0.6;
+    static constexpr double STARTUP_SCAN_STEP  = M_PI / 4.0;  // 45 degrees
+
     // Minimum spacing (meters) when subsampling the global plan for MPC refs.
     double min_spacing_global_plan_ = 0.14;
 
@@ -297,4 +327,4 @@ private:
 
 } // namespace mpc_controller
 
-#endif // MPC_NODE_HPP
+#endif // MPC_CONTROLLER_HPP
