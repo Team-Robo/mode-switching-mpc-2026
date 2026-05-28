@@ -41,7 +41,8 @@ teamrobo2026:
 lidar_filter:
   source_topic: /front/scan
   pub_topic: /front/scan_filtered
-  outlier_threshold: 0.1
+  outlier_threshold: 0.02
+
 
 laser_scan_to_point_cloud:
   # Overridden in move_base_mlda_2026.launch from enable_lidar_filter (filtered vs raw).

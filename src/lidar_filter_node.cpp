@@ -19,6 +19,8 @@ private:
     std::string source_topic_;
     std::string pub_topic_;
     double outlier_threshold_;
+    double min_filter_angle_;
+    double max_filter_angle_;
 
     void lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan);
 };
@@ -26,14 +28,16 @@ private:
 LidarFilter::LidarFilter(ros::NodeHandle& nh, ros::NodeHandle& pnh) : nh_(nh) {
     pnh.param<std::string>("source_topic", source_topic_, "/front/scan");
     pnh.param<std::string>("pub_topic", pub_topic_, "/front/scan_filtered");
-    pnh.param<double>("outlier_threshold", outlier_threshold_, 0.1);
+    pnh.param<double>("outlier_threshold", outlier_threshold_, 0.02);
+    pnh.param<double>("min_filter_angle", min_filter_angle_, -1.57);  // -90 degrees
+    pnh.param<double>("max_filter_angle", max_filter_angle_, 1.57);  // 90 degrees
 
     scan_pub_ = nh_.advertise<sensor_msgs::LaserScan>(pub_topic_, 10);
     scan_sub_ = nh_.subscribe<sensor_msgs::LaserScan>(
         source_topic_, 10, &LidarFilter::lidarCallback, this);
 
-    ROS_INFO("[lidar_filter] %s -> %s (outlier_threshold=%.3f m)",
-             source_topic_.c_str(), pub_topic_.c_str(), outlier_threshold_);
+    ROS_INFO("[lidar_filter] %s -> %s (outlier_threshold=%.3f m, min_filter_angle=%.3f rad, max_filter_angle=%.3f rad)",
+             source_topic_.c_str(), pub_topic_.c_str(), outlier_threshold_, min_filter_angle_, max_filter_angle_);
 }
 
 void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
@@ -59,6 +63,14 @@ void LidarFilter::lidarCallback(const sensor_msgs::LaserScan::ConstPtr& scan) {
     }
 
     for (int i = 1; i < n_ranges - 1; ++i) {
+
+        const double angle = scan->angle_min + i * scan->angle_increment;
+
+        //only filter points between -90 and 90 degrees (front half of the scan)
+        if (angle < min_filter_angle_ || angle > max_filter_angle_) {
+            continue;
+        }
+
         const float prev_range = filtered.ranges[i - 1];
         const float current_range = filtered.ranges[i];
         const float next_range = filtered.ranges[i + 1];
