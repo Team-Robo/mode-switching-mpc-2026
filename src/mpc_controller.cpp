@@ -13,6 +13,14 @@
 namespace mpc_controller {
 
 namespace {
+inline bool checkAcadosSetterStatus(int status, const char* api, const char* field, int stage) {
+    if (status == 0) {
+        return true;
+    }
+    ROS_ERROR("MPC_FAIL_SET api=%s field=%s stage=%d status=%d", api, field, stage, status);
+    return false;
+}
+
 inline void normalize2D(double& x, double& y) {
     const double n = std::sqrt(x * x + y * y);
     if (n > 1e-9) {
@@ -29,9 +37,8 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     : nh_(nh), nh_private_(nh_private)
 {
     nh_private_.param<double>("v_linear_max",      v_linear_max_,      2.0);
-    nh_private_.param<double>("v_static_obs_max",  v_static_obs_max_,  1.0);
+    nh_private_.param<double>("v_ref_static",      v_ref_static_,      1.0);
     nh_private_.param<double>("omega_max",          omega_max_,         1.8);
-    nh_private_.param<double>("omega_static_obs_max", omega_static_obs_max_, 1.0);
 
     nh_private_.param<double>("weight_position_error",  weight_position_error_,  128.0);
     nh_private_.param<double>("weight_heading_error",   weight_heading_error_,   57.0);
@@ -81,6 +88,11 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("dyn_plan_smoothing", dyn_plan_smoothing_, 0.35);
 
     nh_private_.param<double>("min_spacing_global_plan", min_spacing_global_plan_, 0.14);
+    nh_private_.param<bool>("retry_profile_enabled", retry_profile_enabled_, true);
+    nh_private_.param<int>("retry_profile_max_attempts", retry_profile_max_attempts_, 1);
+    nh_private_.param<double>("retry_v_ref_scale", retry_v_ref_scale_, 0.7);
+    nh_private_.param<double>("retry_heading_weight_scale", retry_heading_weight_scale_, 0.7);
+    nh_private_.param<double>("retry_accel_weight_scale", retry_accel_weight_scale_, 1.5);
     nh_private_.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
     nh_private_.param<bool>("bench_log_enabled", bench_log_enabled_, true);
     nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
@@ -88,8 +100,8 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Startup scan: %s (fixed sweep ±45° / 90° @ %.1f rad/s)",
             enable_startup_scan_ ? "ENABLED" : "disabled", STARTUP_SCAN_OMEGA);
-    ROS_INFO("  Velocity: NORMAL/DYN=%.2f m/s  STATIC=%.2f m/s  omega=%.2f rad/s",
-             v_linear_max_, v_static_obs_max_, omega_max_);
+    ROS_INFO("  Velocity: cap(NORMAL/DYN/STATIC)=%.2f m/s  STATIC v_ref=%.2f m/s  omega_cap=%.2f rad/s",
+             v_linear_max_, v_ref_static_, omega_max_);
     ROS_INFO("  Weights: pos=%.2f  heading=%.2f  accel=%.4f  velocity=%.2f",
              weight_position_error_, weight_heading_error_, weight_acceleration_, weight_velocity_);
     ROS_INFO("  Accel mults: static=%.1f  dynamic=%.1f",
@@ -109,6 +121,12 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("  Dynamic behavior plan: influence=%.2f m  margin=%.2f m  max_shift=%.2f m  smooth=%.2f",
              dyn_plan_influence_dist_, dyn_plan_margin_, dyn_plan_max_lateral_shift_, dyn_plan_smoothing_);
     ROS_INFO("  Global plan min spacing: %.2f m", min_spacing_global_plan_);
+    ROS_INFO("  Retry profile: enabled=%s attempts=%d vref_scale=%.2f heading_scale=%.2f accel_scale=%.2f",
+             retry_profile_enabled_ ? "true" : "false",
+             retry_profile_max_attempts_, retry_v_ref_scale_,
+             retry_heading_weight_scale_, retry_accel_weight_scale_);
+    ROS_INFO("  Safety settings: robot_radius=%.2f m  dynamic_obs_radius=%.2f m  safety_margin=%.2f m obs_search_radius=%.2f m",
+             robot_radius_, dynamic_obs_radius_, safety_margin_, obs_search_radius_);
     ROS_INFO("  Bench logging: enabled=%s  period=%.2f s",
              bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
 
@@ -204,6 +222,23 @@ bool MpcController::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan,
                             tf2_ros::Buffer* tf) {
     if (plan.empty() || tf == nullptr) return false;
 
+    geometry_msgs::PoseStamped goal_out;
+    try {
+        geometry_msgs::PoseStamped goal_in = plan.back();
+        if (goal_in.header.frame_id.empty()) {
+            ROS_WARN_THROTTLE(2.0, "setPlan: goal pose has empty frame_id");
+            return false;
+        }
+        if (goal_in.header.frame_id == odom_frame_) {
+            goal_out = goal_in;
+        } else {
+            goal_out = tf->transform(goal_in, odom_frame_, ros::Duration(0.2));
+        }
+    } catch (const tf2::TransformException& ex) {
+        ROS_WARN_THROTTLE(2.0, "setPlan goal TF: %s", ex.what());
+        return false;
+    }
+
     std::vector<double> xs, ys;
     const int skip = (plan.size() <= static_cast<size_t>(2 * (N_ + 5))) ? 1 : 2;
 
@@ -228,7 +263,31 @@ bool MpcController::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan,
         ys.push_back(out.pose.position.y);
     }
 
+    goal_x_ = goal_out.pose.position.x;
+    goal_y_ = goal_out.pose.position.y;
+    goal_yaw_ = quaternionToYaw(goal_out.pose.orientation);
+    goal_pose_valid_ = true;
+
+    if (xs.empty()) {
+        xs.push_back(goal_x_);
+        ys.push_back(goal_y_);
+    } else {
+        const double dx_goal = xs.back() - goal_x_;
+        const double dy_goal = ys.back() - goal_y_;
+        if ((dx_goal * dx_goal + dy_goal * dy_goal) > 1e-8) {
+            xs.push_back(goal_x_);
+            ys.push_back(goal_y_);
+        }
+    }
+
     ingestGlobalPlan(xs, ys);
+    if (goal_pose_valid_) {
+        if (theta_ref_.empty()) {
+            theta_ref_.push_back(goal_yaw_);
+        } else {
+            theta_ref_.back() = headingPreprocess(theta_ref_.back(), goal_yaw_);
+        }
+    }
     return !og_x_ref_.empty();
 }
 
@@ -238,17 +297,27 @@ void MpcController::updateRobotPose(const geometry_msgs::PoseStamped& pose) {
     current_state_[2] = quaternionToYaw(pose.pose.orientation);
 }
 
+bool MpcController::getGoalPose(double& gx, double& gy, double& gyaw) const {
+    if (!goal_pose_valid_) {
+        return false;
+    }
+    gx = goal_x_;
+    gy = goal_y_;
+    gyaw = goal_yaw_;
+    return true;
+}
+
 bool MpcController::isGoalReached(double xy_tolerance, double yaw_tolerance) const {
     if (og_x_ref_.empty() || current_state_.size() < 3) return false;
-    const double gx = og_x_ref_.back();
-    const double gy = og_y_ref_.back();
+    const double gx = goal_pose_valid_ ? goal_x_ : og_x_ref_.back();
+    const double gy = goal_pose_valid_ ? goal_y_ : og_y_ref_.back();
     const double dx = gx - current_state_[0];
     const double dy = gy - current_state_[1];
     const double dist = std::sqrt(dx * dx + dy * dy);
     if (dist > xy_tolerance) return false;
 
-    if (theta_ref_.empty()) return true;
-    const double goal_yaw = theta_ref_.back();
+    if (!goal_pose_valid_ && theta_ref_.empty()) return true;
+    const double goal_yaw = goal_pose_valid_ ? goal_yaw_ : theta_ref_.back();
     const double yaw_err = std::abs(diffAngle(current_state_[2], goal_yaw));
     return yaw_err <= yaw_tolerance;
 }
@@ -301,7 +370,7 @@ double MpcController::diffAngle(double a1, double a2) const {
     return diff;
 }
 
-bool MpcController::isLeft(double rx, double ry, double rtheta, double ox, double oy) {
+bool MpcController::isLeft(double rx, double ry, double rtheta, double ox, double oy) const {
     double dx = ox - rx, dy = oy - ry;
     return (-std::sin(rtheta)*dx + std::cos(rtheta)*dy) > 0;
 }
@@ -558,7 +627,7 @@ void MpcController::warmStartFromCurrentState(const std::vector<double>& current
 }
 
 // =============================================================================
-// selectObstacles — 2 closest static + up to 10 dynamic obstacles
+// selectObstacles — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic obstacles
 //   p_data layout: [x0,y0, x1,y1,   x2,y2, ..., x11,y11]
 //                   ^---static---^   ^-------dynamic-------^
 // =============================================================================
@@ -566,7 +635,7 @@ void MpcController::selectObstacles(
     const std::vector<double>& obs_x,
     const std::vector<double>& obs_y,
     const std::vector<PredictedObstacle>& predicted_obstacles,
-    double rx, double ry,
+    double rx, double ry, double rtheta,
     int stage,
     double search_radius_sq,
     double p_data[24]) const
@@ -574,29 +643,36 @@ void MpcController::selectObstacles(
     constexpr int N_STATIC  = 2;
     constexpr int N_DYNAMIC = 10;
 
-    // --- 2 closest static obstacles ---
-    struct StaticCand { double x, y, dist_sq; };
-    std::vector<StaticCand> static_cands;
-    static_cands.reserve(obs_x.size());
+    // --- static obstacles: one closest on LEFT, one closest on RIGHT ---
+    double left_x = 1000.0;
+    double left_y = 1000.0;
+    double right_x = 1000.0;
+    double right_y = 1000.0;
+    double left_dist_sq = std::numeric_limits<double>::max();
+    double right_dist_sq = std::numeric_limits<double>::max();
     for (size_t j = 0; j < obs_x.size(); ++j) {
         double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
         double d2 = dx*dx + dy*dy;
         if (d2 > search_radius_sq) continue;
-        static_cands.push_back({obs_x[j], obs_y[j], d2});
-    }
-    std::partial_sort(static_cands.begin(),
-                      static_cands.begin() + std::min((int)static_cands.size(), N_STATIC),
-                      static_cands.end(),
-                      [](const StaticCand& a, const StaticCand& b){ return a.dist_sq < b.dist_sq; });
-    for (int k = 0; k < N_STATIC; ++k) {
-        if (k < (int)static_cands.size()) {
-            p_data[2*k+0] = static_cands[k].x;
-            p_data[2*k+1] = static_cands[k].y;
+        const bool on_left = isLeft(rx, ry, rtheta, obs_x[j], obs_y[j]);
+        if (on_left) {
+            if (d2 < left_dist_sq) {
+                left_dist_sq = d2;
+                left_x = obs_x[j];
+                left_y = obs_y[j];
+            }
         } else {
-            p_data[2*k+0] = 1000.0;
-            p_data[2*k+1] = 1000.0;
+            if (d2 < right_dist_sq) {
+                right_dist_sq = d2;
+                right_x = obs_x[j];
+                right_y = obs_y[j];
+            }
         }
     }
+    p_data[0] = left_x;
+    p_data[1] = left_y;
+    p_data[2] = right_x;
+    p_data[3] = right_y;
 
     // --- up to 10 dynamic obstacles (sorted by effective distance) ---
     struct DynCand { double x, y, eff_dist; };
@@ -674,14 +750,26 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     ros::WallTime t_after_cost = t_start;
     ros::WallTime t_after_params = t_start;
     ros::WallTime t_after_solve = t_start;
+    constexpr double kWheelSpeedLimit = 2.0;
+    auto check_set = [&](int status, const char* api, const char* field, int stage) -> bool {
+        return checkAcadosSetterStatus(status, api, field, stage);
+    };
 
     // =========================================================================
     // 1. INITIAL STATE CONSTRAINT
     // =========================================================================
-    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
-                                  "lbx", (void*)current_state.data());
-    ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
-                                  "ubx", (void*)current_state.data());
+    if (!check_set(
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
+                                          "lbx", (void*)current_state.data()),
+            "ocp_nlp_constraints_model_set", "lbx", 0)) {
+        return false;
+    }
+    if (!check_set(
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0,
+                                          "ubx", (void*)current_state.data()),
+            "ocp_nlp_constraints_model_set", "ubx", 0)) {
+        return false;
+    }
     t_after_init = ros::WallTime::now();
 
     // =========================================================================
@@ -905,8 +993,8 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
             break;
 
         case ControlMode::STATIC_OBS:
-            v_cap                  = v_static_obs_max_;
-            omega_cap              = omega_static_obs_max_;
+            v_cap                  = v_linear_max_;
+            omega_cap              = omega_max_;
             effective_accel_weight = weight_acceleration_ * accel_weight_mult_static_;
             eff_pos_weight         = weight_position_error_;
             eff_heading_weight     = weight_heading_error_;
@@ -932,17 +1020,25 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
             break;
     }
 
+    const bool apply_retry_profile =
+        retry_profile_active_ &&
+        (mode_ == ControlMode::STATIC_OBS || mode_ == ControlMode::NORMAL);
+    if (apply_retry_profile) {
+        eff_heading_weight *= std::max(0.0, retry_heading_weight_scale_);
+        effective_accel_weight *= std::max(0.0, retry_accel_weight_scale_);
+    }
+
     // =========================================================================
     // 7. REVERSAL OVERLAY
     // =========================================================================
     std::vector<double> effective_theta_ref = theta_ref;
-    in_reversal_ = checkReversalNeeded(theta_ref, current_state[2]);
-    if (in_reversal_) {
-        reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
-        effective_theta_ref = reverse_theta_ref_;
-        display_text_ = "REV+" + display_text_;
-        ROS_INFO_THROTTLE(1.0, "Reversal overlay active");
-    }
+    // in_reversal_ = checkReversalNeeded(theta_ref, current_state[2]);
+    // if (in_reversal_) {
+    //     reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
+    //     effective_theta_ref = reverse_theta_ref_;
+    //     display_text_ = "REV+" + display_text_;
+    //     ROS_INFO_THROTTLE(1.0, "Reversal overlay active");
+    // }
 
     // =========================================================================
     // 8. CONSTRAINT BOUNDS
@@ -964,8 +1060,16 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
         1.0e9, 1.0e9 };
 
     for (int i = 0; i < N_; ++i) {
-        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
-        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
+        if (!check_set(
+                ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh),
+                "ocp_nlp_constraints_model_set", "lh", i)) {
+            return false;
+        }
+        if (!check_set(
+                ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh),
+                "ocp_nlp_constraints_model_set", "uh", i)) {
+            return false;
+        }
     }
     t_after_constraints = ros::WallTime::now();
 
@@ -981,8 +1085,13 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     W[4*ny+4] = effective_accel_weight;
     W[5*ny+5] = effective_accel_weight;
 
-    for (int i = 0; i < N_; ++i)
-        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data());
+    for (int i = 0; i < N_; ++i) {
+        if (!check_set(
+                ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "W", W.data()),
+                "ocp_nlp_cost_model_set", "W", i)) {
+            return false;
+        }
+    }
 
     // Terminal cost W_e: [x, y, theta] — ny_e = 3
     {
@@ -997,7 +1106,11 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
             W_e[1*ny_e+1] = eff_pos_weight;
             W_e[2*ny_e+2] = eff_heading_weight;
         }
-        ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "W", W_e.data());
+        if (!check_set(
+                ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "W", W_e.data()),
+                "ocp_nlp_cost_model_set", "W", N_)) {
+            return false;
+        }
     }
     t_after_cost = ros::WallTime::now();
 
@@ -1038,14 +1151,27 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
         if (i < N_) {
             double v_ref;
             if (mode_ == ControlMode::RUSH_GOAL)         v_ref = rush_vref_;
-            else if (mode_ == ControlMode::STATIC_OBS)   v_ref = v_static_obs_max_;
+            else if (mode_ == ControlMode::STATIC_OBS) {
+                v_ref = std::max(0.0, std::min(v_ref_static_, v_linear_max_));
+                if (apply_retry_profile) {
+                    v_ref *= std::max(0.0, retry_v_ref_scale_);
+                }
+            }
             else if (mode_ == ControlMode::ROTATION_SHIM) v_ref = 0.0;
             else                                          v_ref = v_linear_max_;
             double yref[6] = { sx, sy, st, v_ref, 0.0, 0.0 };
-            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref);
+            if (!check_set(
+                    ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, i, "yref", yref),
+                    "ocp_nlp_cost_model_set", "yref", i)) {
+                return false;
+            }
         } else {
             double yref_e[3] = { sx, sy, st };
-            ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e);
+            if (!check_set(
+                    ocp_nlp_cost_model_set(nlp_config_, nlp_dims_, nlp_in_, N_, "yref", yref_e),
+                    "ocp_nlp_cost_model_set", "yref", N_)) {
+                return false;
+            }
         }
 
         // ---- obstacle parameters — 24 values: 2 static + 10 dynamic ----
@@ -1079,11 +1205,15 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
                 }
             }
             selectObstacles(local_obs_x, local_obs_y, predicted_obstacles_,
-                            pred_x, pred_y,
+                            pred_x, pred_y, st,
                             i, search_radius_sq, p_data);
         }
 
-        jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 24);
+        if (!check_set(
+                jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 24),
+                "jackal_diff_drive_acados_update_params", "p", i)) {
+            return false;
+        }
     }
     t_after_params = ros::WallTime::now();
 
@@ -1092,6 +1222,63 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     // =========================================================================
     int status = jackal_diff_drive_acados_solve(acados_ocp_capsule_);
     if (status != 0) {
+        if (bench_log_enabled_) {
+            int qp_status = -1;
+            int sqp_iter = -1;
+            int nlp_iter = -1;
+            int stat_n = 0;
+            int stat_m = 0;
+            int qp_stat_last = -1;
+            int qp_iter_last = -1;
+            double time_tot = -1.0;
+            double kkt_norm_inf = std::numeric_limits<double>::quiet_NaN();
+            ocp_nlp_get(nlp_solver_, "qp_status", &qp_status);
+            ocp_nlp_get(nlp_solver_, "sqp_iter", &sqp_iter);
+            ocp_nlp_get(nlp_solver_, "nlp_iter", &nlp_iter);
+            ocp_nlp_get(nlp_solver_, "time_tot", &time_tot);
+            ocp_nlp_get(nlp_solver_, "stat_n", &stat_n);
+            ocp_nlp_get(nlp_solver_, "stat_m", &stat_m);
+            if (stat_n >= 2 && stat_m > 0) {
+                const int nrow = std::min(nlp_iter + 1, stat_m);
+                if (nrow > 0) {
+                    std::vector<double> statistics((stat_n + 1) * nrow, 0.0);
+                    ocp_nlp_get(nlp_solver_, "statistics", statistics.data());
+                    const int last_i = nrow - 1;
+                    qp_stat_last = static_cast<int>(statistics[last_i + 1 * nrow]);
+                    qp_iter_last = static_cast<int>(statistics[last_i + 2 * nrow]);
+                }
+            }
+            ocp_nlp_out_get(nlp_config_, nlp_dims_, nlp_out_, 0, "kkt_norm_inf", &kkt_norm_inf);
+
+            const double vr = (current_state.size() > 3) ? current_state[3] : 0.0;
+            const double vl = (current_state.size() > 4) ? current_state[4] : 0.0;
+            const double v_meas = 0.5 * (vr + vl);
+            const double omega_meas = (vr - vl) / WHEELBASE;
+            const double v_viol = std::max(0.0, std::fabs(v_meas) - v_cap);
+            const double omega_viol = std::max(0.0, std::fabs(omega_meas) - omega_cap);
+            const double vr_viol = std::max(0.0, std::fabs(vr) - kWheelSpeedLimit);
+            const double vl_viol = std::max(0.0, std::fabs(vl) - kWheelSpeedLimit);
+            const double heading_err_deg =
+                effective_theta_ref.empty() ? 0.0 :
+                diffAngle(current_state[2], effective_theta_ref.front()) * 180.0 / M_PI;
+
+            ROS_WARN(
+                "MPC_FAIL_DIAG status=%d mode=%s v=%.3f v_cap=%.3f w=%.3f w_cap=%.3f "
+                "vr=%.3f vl=%.3f wheel_lim=%.3f viol(v,w,vr,vl)=(%.4f,%.4f,%.4f,%.4f) "
+                "min_dist_sq=%.4f close_static=%.3f close_dynamic=%.3f has_static=%d has_dynamic=%d "
+                "heading_err_deg=%.2f refs=%zu obs=%zu dyn_pred=%zu "
+                "qp_status=%d sqp_iter=%d nlp_iter=%d qp_stat_last=%d qp_iter_last=%d "
+                "kkt_norm_inf=%.3e time_tot_ms=%.3f",
+                status, display_text_.c_str(),
+                v_meas, v_cap, omega_meas, omega_cap,
+                vr, vl, kWheelSpeedLimit,
+                v_viol, omega_viol, vr_viol, vl_viol,
+                min_dist_sq, closest_static_dist, closest_dynamic_dist,
+                has_static_obs ? 1 : 0, has_dynamic_obs ? 1 : 0,
+                heading_err_deg, x_ref.size(), obs_x.size(), predicted_obstacles_.size(),
+                qp_status, sqp_iter, nlp_iter, qp_stat_last, qp_iter_last,
+                kkt_norm_inf, time_tot * 1e3);
+        }
         ROS_WARN("ACADOS solver failed with status %d", status);
         return false;
     }
@@ -1312,6 +1499,17 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         }
         if (x_ref_.empty()) { writeVelocityCommand(0.0, 0.0, cmd_vel); return false; }
 
+        // Ensure the terminal reference contains the exact global-plan goal.
+        const double gx_goal = og_x_ref_.back();
+        const double gy_goal = og_y_ref_.back();
+        const double goal_append_eps_sq = 1e-8;
+        const double dx_goal = x_ref_.back() - gx_goal;
+        const double dy_goal = y_ref_.back() - gy_goal;
+        if ((dx_goal * dx_goal + dy_goal * dy_goal) > goal_append_eps_sq) {
+            x_ref_.push_back(gx_goal);
+            y_ref_.push_back(gy_goal);
+        }
+
         double gx = x_ref_.back(), gy = y_ref_.back();
         while (x_ref_.size() <= static_cast<size_t>(N_)) {
             x_ref_.push_back(gx); y_ref_.push_back(gy);
@@ -1327,6 +1525,9 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
             x_ref_, y_ref_, current_state_[2]);
         while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
             theta_sub.push_back(theta_sub.back());
+        if (goal_pose_valid_ && !theta_sub.empty()) {
+            theta_sub.back() = headingPreprocess(theta_sub.back(), goal_yaw_);
+        }
         if (theta_sub.empty()) {
             writeVelocityCommand(0.0, 0.0, cmd_vel);
             return false;
@@ -1339,8 +1540,28 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         all_obs_y.insert(all_obs_y.end(), map_y_.begin(), map_y_.end());
         t_after_theta_obs = ros::WallTime::now();
 
+        retry_profile_active_ = false;
         bool success = solveOCP(x_ref_, y_ref_, theta_sub,
                                 current_state_, all_obs_x, all_obs_y);
+
+        const int retry_attempts = std::max(0, retry_profile_max_attempts_);
+        if (!success && retry_profile_enabled_ && retry_attempts > 0) {
+            for (int attempt = 1; attempt <= retry_attempts && !success; ++attempt) {
+                retry_profile_active_ = true;
+                ROS_WARN("MPC retry profile attempt %d/%d (mode=%s)",
+                         attempt, retry_attempts, display_text_.c_str());
+                success = solveOCP(x_ref_, y_ref_, theta_sub,
+                                   current_state_, all_obs_x, all_obs_y);
+                if (success) {
+                    ROS_INFO("MPC retry profile recovered on attempt %d/%d",
+                             attempt, retry_attempts);
+                } else {
+                    ROS_WARN("MPC retry profile failed on attempt %d/%d",
+                             attempt, retry_attempts);
+                }
+            }
+        }
+        retry_profile_active_ = false;
         t_after_solve = ros::WallTime::now();
 
         if (success) {

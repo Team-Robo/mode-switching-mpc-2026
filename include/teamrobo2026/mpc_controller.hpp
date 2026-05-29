@@ -57,7 +57,7 @@ enum class StartupScanPhase {
 
 enum class ControlMode {
     NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
-    STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
+    STATIC_OBS,      // Static obstacles detected — normal hard caps, lower speed reference
     DYNAMIC_OBS,     // Dynamic obstacles detected — full speed, higher accel weight
     RUSH_GOAL,       // Near goal while static obs present — blast at v_linear_max_,
                      // obstacles cleared from ACADOS params, heavy position weight
@@ -77,6 +77,7 @@ public:
     bool setPlan(const std::vector<geometry_msgs::PoseStamped>& plan, tf2_ros::Buffer* tf);
 
     bool isGoalReached(double xy_tolerance, double yaw_tolerance) const;
+    bool getGoalPose(double& gx, double& gy, double& gyaw) const;
 
     bool solverReady() const { return solver_ready_; }
 
@@ -138,7 +139,7 @@ private:
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
                             double curr_x, double curr_y, int& min_idx);
-    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy);
+    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy) const;
 
     // Reversal
     bool checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta);
@@ -165,13 +166,13 @@ private:
         double current_heading) const;
 
     // =========================================================================
-    // Obstacle selection — 2 closest static + up to 10 dynamic (24 params)
+    // Obstacle selection — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic (24 params)
     // =========================================================================
     void selectObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
         const std::vector<PredictedObstacle>& predicted_obstacles,
-        double rx, double ry,
+        double rx, double ry, double rtheta,
         int stage,
         double search_radius_sq,
         double p_data[24]) const;
@@ -221,9 +222,8 @@ private:
 
     // --- Velocity limits ---
     double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS & RUSH_GOAL
-    double v_static_obs_max_  = 1.0;   // [m/s] cap for STATIC_OBS
+    double v_ref_static_      = 1.0;   // [m/s] reference speed target for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
-    double omega_static_obs_max_ = 1.0; // [rad/s] cap for STATIC_OBS
 
     // --- Stage cost weights ---
     double weight_position_error_ = 128.0;
@@ -279,6 +279,10 @@ private:
     // Runtime state
     // =========================================================================
     std::vector<double> current_state_;   // [x, y, theta, vr, vl]
+    bool goal_pose_valid_ = false;
+    double goal_x_ = 0.0;
+    double goal_y_ = 0.0;
+    double goal_yaw_ = 0.0;
 
     std::vector<double> og_x_ref_, og_y_ref_, theta_ref_;
     std::vector<double> x_ref_, y_ref_;
@@ -306,6 +310,14 @@ private:
 
     // Minimum spacing (meters) when subsampling the global plan for MPC refs.
     double min_spacing_global_plan_ = 0.14;
+
+    // Failure retry profile (applied to STATIC_OBS/NORMAL on retry solve only)
+    bool   retry_profile_enabled_ = true;
+    int    retry_profile_max_attempts_ = 1;
+    double retry_v_ref_scale_ = 0.7;
+    double retry_heading_weight_scale_ = 0.7;
+    double retry_accel_weight_scale_ = 1.5;
+    bool   retry_profile_active_ = false;
 
     // TF frame for published trajectories / markers
     std::string odom_frame_ = "odom";

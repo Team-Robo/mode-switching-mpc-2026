@@ -2,6 +2,7 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <nav_msgs/OccupancyGrid.h>
+#include <visualization_msgs/Marker.h>
 #include <tf/transform_listener.h>
 #include <tf/transform_datatypes.h>
 #include <cmath>
@@ -9,10 +10,12 @@
 
 class OccupancyToCloud {
 private:
-    const double BOX_LENGTH = 1.0;  // full side of local search bbox around the robot [m]
+    double bbox_length_ = 3.0;  // full side of local search bbox around the robot [m]
+    bool bbox_viz_enabled_ = true;
     const double PORTION_OF_PI = 3.0 / 4.0;
     const std::string TOPIC_LOCAL_MAP = "/move_base/local_costmap/costmap";
     const std::string TOPIC_MAP_CLOUD = "/map/cloud";
+    const std::string TOPIC_BBOX_MARKER = "/map/cloud_bbox";
 
     nav_msgs::OccupancyGrid map;
     std::vector<std::vector<int8_t>> map_grid;
@@ -29,6 +32,7 @@ private:
 
     ros::Subscriber sub_map;
     ros::Publisher pub_point_cloud;
+    ros::Publisher pub_bbox_marker_;
     tf::TransformListener tf_listener;
 
 public:
@@ -40,10 +44,15 @@ public:
         ros::NodeHandle nh_private("~");
         nh_private.param<bool>("bench_log_enabled", bench_log_enabled_, true);
         nh_private.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+        nh_private.param<double>("bbox_length", bbox_length_, 3.0);
+        nh_private.param<bool>("bbox_viz_enabled", bbox_viz_enabled_, true);
         nh_private.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
         nh_private.param<std::string>("base_frame", base_frame_, std::string("base_link"));
+        pub_bbox_marker_ = nh.advertise<visualization_msgs::Marker>(TOPIC_BBOX_MARKER, 1);
         ROS_INFO("[OccupancyToCloud] bench logging: enabled=%s period=%.2fs",
                  bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
+        ROS_INFO("[OccupancyToCloud] bbox_length=%.2fm bbox_viz_enabled=%s",
+                 bbox_length_, bbox_viz_enabled_ ? "true" : "false");
     }
 
     void callbackMap(const nav_msgs::OccupancyGrid::ConstPtr& msg) {
@@ -122,7 +131,7 @@ public:
         double x_map_to_chassis = tx - map_origin[0];
         double y_map_to_chassis = ty - map_origin[1];
 
-        double half = BOX_LENGTH / 2.0;
+        double half = std::max(0.0, bbox_length_) / 2.0;
         double tl_x = x_map_to_chassis - half,  tl_y = y_map_to_chassis - half;
         double br_x = x_map_to_chassis + half,  br_y = y_map_to_chassis + half;
 
@@ -140,6 +149,37 @@ public:
         ibrx = std::max(0, std::min(ibrx, W - 1));
         ibry = std::max(0, std::min(ibry, H - 1));
         t_after_bbox = ros::WallTime::now();
+
+        if (bbox_viz_enabled_) {
+            const double x_min = tl_x + map_origin[0];
+            const double y_min = tl_y + map_origin[1];
+            const double x_max = br_x + map_origin[0];
+            const double y_max = br_y + map_origin[1];
+
+            visualization_msgs::Marker bbox;
+            bbox.header.frame_id = odom_frame_;
+            bbox.header.stamp = ros::Time::now();
+            bbox.ns = "map_cloud_bbox";
+            bbox.id = 0;
+            bbox.type = visualization_msgs::Marker::LINE_STRIP;
+            bbox.action = visualization_msgs::Marker::ADD;
+            bbox.pose.orientation.w = 1.0;
+            bbox.scale.x = 0.03;
+            bbox.color.a = 1.0;
+            bbox.color.r = 0.1f;
+            bbox.color.g = 0.7f;
+            bbox.color.b = 1.0f;
+
+            geometry_msgs::Point p;
+            p.z = 0.05;
+            p.x = x_min; p.y = y_min; bbox.points.push_back(p);
+            p.x = x_max; p.y = y_min; bbox.points.push_back(p);
+            p.x = x_max; p.y = y_max; bbox.points.push_back(p);
+            p.x = x_min; p.y = y_max; bbox.points.push_back(p);
+            p.x = x_min; p.y = y_min; bbox.points.push_back(p);
+
+            pub_bbox_marker_.publish(bbox);
+        }
 
         // -----------------------------------------------------------------------
         // Angle bins
