@@ -20,6 +20,7 @@ find_package(catkin REQUIRED COMPONENTS
     pcl_conversions
     obstacle_detector
     nav_core
+    base_local_planner
     costmap_2d
     pluginlib
 )
@@ -90,6 +91,7 @@ catkin_package(
         pcl_conversions
         obstacle_detector
         nav_core
+        base_local_planner
         costmap_2d
         pluginlib
     INCLUDE_DIRS include
@@ -193,9 +195,11 @@ if(ACADOS_INSTALL_DIR)
         src/mpc_local_planner_ros.cpp
     )
     target_link_libraries(teamrobo2026_mpc_planner
+        "-Wl,--no-as-needed"
         ${catkin_LIBRARIES}
         ${ACADOS_LIBRARIES}
         m
+        "-Wl,--as-needed"
     )
     if(TARGET acados_solver_lib)
         target_link_libraries(teamrobo2026_mpc_planner acados_solver_lib)
