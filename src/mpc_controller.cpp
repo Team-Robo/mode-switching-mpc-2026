@@ -1635,6 +1635,7 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
 
             if (consecutive_solve_failures_ >= RECOVERY_TRIGGER_COUNT && !recovery_active_) {
                 recovery_active_ = true;
+                ROS_WARN("[RECOVERY] ACTIVATED — backtracking along reference path");
                 recovery_path_x_.clear();
                 recovery_path_y_.clear();
                 const int snap_end = std::min(path_progress_idx_,
@@ -1678,7 +1679,7 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                 double travel_dir  = current_state_[2] + M_PI;
                 double heading_err = std::atan2(std::sin(desired_dir - travel_dir),
                                                 std::cos(desired_dir - travel_dir));
-                double w_recovery  = std::clamp(2.0 * heading_err, -omega_max_, omega_max_);
+                double w_recovery  = std::max(-omega_max_, std::min(2.0 * heading_err, omega_max_));
                 display_text_      = "RECOVERY";
                 writeVelocityCommand(RECOVERY_V, w_recovery, cmd_vel);
                 return true;
