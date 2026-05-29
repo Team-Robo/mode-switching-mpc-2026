@@ -12,7 +12,9 @@ static_obs_safe_dist: 1.2
 
 min_spacing_global_plan: 0.05
 
-v_ref_static: 0.8
+v_linear_max: 2.0
+v_ref_static: 0.4
+omega_max: 2.5
 
 retry_profile_enabled: false
 retry_profile_max_attempts: 1
@@ -45,10 +47,10 @@ shim_omega: 0.4
 
 obs_search_radius: 5.0
 
-bench_log_enabled: false
+bench_log_enabled: true
 bench_log_period_s: 1.0
 
-enable_startup_scan: true
+enable_startup_scan: false
 
 xy_goal_tolerance: 0.25
 yaw_goal_tolerance: 0.157
@@ -64,4 +66,4 @@ rotate_to_goal_block_unknown: true
 odom_frame: odom
 
 robot_radius: 0.22
-safety_margin: 0.01
+safety_margin: 0.03

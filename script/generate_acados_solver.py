@@ -140,8 +140,8 @@ def setup_acados_ocp():
     ocp.constraints.lbx   = np.array([-2.0, -2.0])
     ocp.constraints.ubx   = np.array([ 2.0,  2.0])
 
-    ocp.constraints.lbu    = np.array([-2.0, -2.0])
-    ocp.constraints.ubu    = np.array([ 2.0,  2.0])
+    ocp.constraints.lbu    = np.array([-4.0, -4.0])
+    ocp.constraints.ubu    = np.array([ 4.0,  4.0])
     ocp.constraints.idxbu  = np.array([0, 1])
 
     # overwritten in mpc_controller.cpp
