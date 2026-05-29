@@ -330,10 +330,10 @@ private:
     int  consecutive_solve_failures_ = 0;
     int  recovery_ticks_remaining_   = 0;
     bool recovery_active_            = false;
-    static constexpr int    RECOVERY_TRIGGER_COUNT = 3;
-    static constexpr int    RECOVERY_TICKS         = 15;
-    static constexpr double RECOVERY_V             = -0.3;
-    static constexpr double RECOVERY_W             = 0.0;
+    static constexpr int    RECOVERY_TRIGGER_COUNT  = 3;
+    static constexpr int    RECOVERY_TICKS          = 15;
+    static constexpr double RECOVERY_V              = -0.3;
+    static constexpr double RECOVERY_WAYPOINT_THRESH = 0.15;
 
     std::vector<double> recovery_path_x_;
     std::vector<double> recovery_path_y_;

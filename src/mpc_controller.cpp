@@ -1401,13 +1401,8 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
             consecutive_solve_failures_++;
             ROS_WARN("MPC solve failed (%d consecutive)", consecutive_solve_failures_);
 
-            // this one uses the original reference path (og_x_ref_, og_y_ref_).
             if (consecutive_solve_failures_ >= RECOVERY_TRIGGER_COUNT && !recovery_active_) {
                 recovery_active_ = true;
-
-                // Snapshot the already-traversed path in reverse order.
-                // path_progress_idx_ is the current position on og_x_ref_.
-                // Everything before it was driven through collision-free.
                 recovery_path_x_.clear();
                 recovery_path_y_.clear();
                 const int snap_end = std::min(path_progress_idx_,
@@ -1416,24 +1411,44 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                     recovery_path_x_.push_back(og_x_ref_[k]);
                     recovery_path_y_.push_back(og_y_ref_[k]);
                 }
-                recovery_path_idx_        = 0;
-                recovery_ticks_remaining_ = static_cast<int>(recovery_path_x_.size()) * 3 + 10;
-                ROS_WARN("[RECOVERY] Backtracking along %zu traversed waypoints",
-                         recovery_path_x_.size());
+                recovery_path_idx_ = 0;
+                // Safety timeout: arc length / speed * 25 Hz * 2x buffer
+                double arc_len = 0.0;
+                for (int k = 1; k < (int)recovery_path_x_.size(); ++k)
+                    arc_len += std::hypot(recovery_path_x_[k] - recovery_path_x_[k - 1],
+                                         recovery_path_y_[k] - recovery_path_y_[k - 1]);
+                recovery_ticks_remaining_ = static_cast<int>(arc_len / std::abs(RECOVERY_V) * 50.0) + 30;
+                ROS_WARN("[RECOVERY] Backtracking along %zu waypoints (%.2f m, %d tick budget)",
+                         recovery_path_x_.size(), arc_len, recovery_ticks_remaining_);
             }
 
-            // this one does not use the original reference path, it just triggers the recovery mode which will then use the original reference path (og_x_ref_, og_y_ref_) for backtracking
-            // if (consecutive_solve_failures_ >= RECOVERY_TRIGGER_COUNT && !recovery_active_) {
-            //     recovery_active_          = true;
-            //     recovery_ticks_remaining_ = RECOVERY_TICKS;
-            //     ROS_WARN("[RECOVERY] Triggering open-loop backtrack for %d ticks",
-            //              recovery_ticks_remaining_);
-            // }               
+            if (recovery_active_) {
+                // Advance past waypoints already within threshold
+                while (recovery_path_idx_ < (int)recovery_path_x_.size()) {
+                    double dx = recovery_path_x_[recovery_path_idx_] - current_state_[0];
+                    double dy = recovery_path_y_[recovery_path_idx_] - current_state_[1];
+                    if (std::hypot(dx, dy) > RECOVERY_WAYPOINT_THRESH) break;
+                    recovery_path_idx_++;
+                }
+                // This is to prevent overshooting the backtrack path if the solver is failing repeatedly while already on the recovery path.  If we exhaust the path or run out of time, stop and wait for the next MPC solution to hopefully be feasible again.
+                if (recovery_path_idx_ >= (int)recovery_path_x_.size() || recovery_ticks_remaining_ <= 0) {
+                    ROS_WARN("[RECOVERY] Finished (idx=%d/%zu ticks=%d)",
+                             recovery_path_idx_, recovery_path_x_.size(), recovery_ticks_remaining_);
+                    recovery_active_ = false;
+                    writeVelocityCommand(0.0, 0.0, cmd_vel);
+                    return false;
+                }
 
-            if (recovery_active_ && recovery_ticks_remaining_ > 0) {
                 recovery_ticks_remaining_--;
-                display_text_ = "RECOVERY";
-                writeVelocityCommand(RECOVERY_V, RECOVERY_W, cmd_vel);
+                double dx          = recovery_path_x_[recovery_path_idx_] - current_state_[0];
+                double dy          = recovery_path_y_[recovery_path_idx_] - current_state_[1];
+                double desired_dir = std::atan2(dy, dx);
+                double travel_dir  = current_state_[2] + M_PI;
+                double heading_err = std::atan2(std::sin(desired_dir - travel_dir),
+                                                std::cos(desired_dir - travel_dir));
+                double w_recovery  = std::clamp(2.0 * heading_err, -omega_max_, omega_max_);
+                display_text_      = "RECOVERY";
+                writeVelocityCommand(RECOVERY_V, w_recovery, cmd_vel);
                 return true;
             }
             writeVelocityCommand(0.0, 0.0, cmd_vel);
