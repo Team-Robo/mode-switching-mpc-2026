@@ -332,7 +332,7 @@ private:
     bool recovery_active_            = false;
     static constexpr int    RECOVERY_TRIGGER_COUNT  = 3;
     static constexpr int    RECOVERY_TICKS          = 15;
-    static constexpr double RECOVERY_V              = -0.3;
+    static constexpr double RECOVERY_V              = -0.2;
     static constexpr double RECOVERY_WAYPOINT_THRESH = 0.15;
 
     std::vector<double> recovery_path_x_;
