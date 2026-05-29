@@ -953,19 +953,44 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     } else {
         min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
     }
-    // 14 constraints: v_linear, omega, 12 × distance_sq (2 static + 10 dynamic)
-    double lh[14] = { -v_cap, -omega_cap,
-        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
-        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
-        min_dist_sq, min_dist_sq };
-    double uh[14] = {  v_cap,  omega_cap,
-        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
-        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
-        1.0e9, 1.0e9 };
+    double lh[14] = {
+        -v_cap,
+        -omega_cap,   // angular velocity lower
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, 
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq
+    };
+    double uh[14] = {
+        v_cap,
+        omega_cap,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9};
+
+    // Build stage-0 bounds using physical limits (never the behavioral cap)
+    double lh0[14] = {
+        -v_linear_max_,
+        -omega_max_,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
+        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq
+    };
+    double uh0[14] = {
+        v_linear_max_,
+        omega_max_,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9,
+        1.0e9, 1.0e9, 1.0e9, 1.0e9
+    };
 
     for (int i = 0; i < N_; ++i) {
-        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
-        ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
+        if (i == 0) {
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "lh", lh0);
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, 0, "uh", uh0);
+        } else {
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "lh", lh);
+            ocp_nlp_constraints_model_set(nlp_config_, nlp_dims_, nlp_in_, nlp_out_, i, "uh", uh);
+        }
     }
     t_after_constraints = ros::WallTime::now();
 
