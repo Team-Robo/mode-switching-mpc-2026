@@ -2,6 +2,7 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
 #include <nav_msgs/OccupancyGrid.h>
+#include <visualization_msgs/Marker.h>
 #include <tf/transform_listener.h>
 #include <tf/transform_datatypes.h>
 #include <cmath>
@@ -9,10 +10,12 @@
 
 class OccupancyToCloud {
 private:
-    const double BOX_HALFLENGTH = 1.0;
+    double bbox_length_ = 3.0;  // full side of local search bbox around the robot [m]
+    bool bbox_viz_enabled_ = true;
     const double PORTION_OF_PI = 3.0 / 4.0;
     const std::string TOPIC_LOCAL_MAP = "/move_base/local_costmap/costmap";
     const std::string TOPIC_MAP_CLOUD = "/map/cloud";
+    const std::string TOPIC_BBOX_MARKER = "/map/cloud_bbox";
 
     nav_msgs::OccupancyGrid map;
     std::vector<std::vector<int8_t>> map_grid;
@@ -21,8 +24,15 @@ private:
     uint32_t last_map_seq_ = 0;
     bool map_updated_ = false;
 
+    bool bench_log_enabled_ = true;
+    double bench_log_period_s_ = 1.0;
+
+    std::string odom_frame_ = "odom";
+    std::string base_frame_ = "base_link";
+
     ros::Subscriber sub_map;
     ros::Publisher pub_point_cloud;
+    ros::Publisher pub_bbox_marker_;
     tf::TransformListener tf_listener;
 
 public:
@@ -30,9 +40,23 @@ public:
         sub_map = nh.subscribe(TOPIC_LOCAL_MAP, 1, &OccupancyToCloud::callbackMap, this);
         pub_point_cloud = nh.advertise<sensor_msgs::PointCloud2>(TOPIC_MAP_CLOUD, 1);
         map_origin.resize(2);
+
+        ros::NodeHandle nh_private("~");
+        nh_private.param<bool>("bench_log_enabled", bench_log_enabled_, true);
+        nh_private.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+        nh_private.param<double>("bbox_length", bbox_length_, 3.0);
+        nh_private.param<bool>("bbox_viz_enabled", bbox_viz_enabled_, true);
+        nh_private.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
+        nh_private.param<std::string>("base_frame", base_frame_, std::string("base_link"));
+        pub_bbox_marker_ = nh.advertise<visualization_msgs::Marker>(TOPIC_BBOX_MARKER, 1);
+        ROS_INFO("[OccupancyToCloud] bench logging: enabled=%s period=%.2fs",
+                 bench_log_enabled_ ? "true" : "false", bench_log_period_s_);
+        ROS_INFO("[OccupancyToCloud] bbox_length=%.2fm bbox_viz_enabled=%s",
+                 bbox_length_, bbox_viz_enabled_ ? "true" : "false");
     }
 
     void callbackMap(const nav_msgs::OccupancyGrid::ConstPtr& msg) {
+        const auto t_cb_start = ros::WallTime::now();
         if (msg->header.seq == last_map_seq_) return;
         last_map_seq_ = msg->header.seq;
         map_updated_  = true;
@@ -46,17 +70,29 @@ public:
         int map_width  = msg->info.width;
         int map_height = msg->info.height;
 
+        const auto t_before_grid = ros::WallTime::now();
+
         // Reshape flat data into column-major 2-D grid
         map_grid.assign(map_width, std::vector<int8_t>(map_height));
         for (int i = 0; i < map_width; ++i)
             for (int j = 0; j < map_height; ++j)
                 map_grid[i][j] = msg->data[j * map_width + i];
 
+        const auto t_after_grid = ros::WallTime::now();
+
         map_origin[0] = map_Ox;
         map_origin[1] = map_Oy;
 
         ROS_INFO_THROTTLE(2.0, "Map updated: %d x %d, res=%.3f, origin=(%.2f, %.2f)",
                           map_width, map_height, map_res, map_Ox, map_Oy);
+        if (bench_log_enabled_) {
+            const auto t_cb_end = ros::WallTime::now();
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][occupancy_to_cloud][callbackMap] total="
+                << (t_cb_end - t_cb_start).toSec() * 1e3 << " ms"
+                << " | reshape_grid=" << (t_after_grid - t_before_grid).toSec() * 1e3 << " ms"
+                << " | size=" << map_width << "x" << map_height);
+        }
     }
 
     double boundedAngle(double angle) {
@@ -67,17 +103,25 @@ public:
     }
 
     void run() {
+        const auto t_start = ros::WallTime::now();
         if (map_grid.empty()) return;
         if (!map_updated_) return;
         map_updated_ = false;
 
+        ros::WallTime t_after_tf = t_start;
+        ros::WallTime t_after_bbox = t_start;
+        ros::WallTime t_after_bin_loop = t_start;
+        ros::WallTime t_after_count = t_start;
+        ros::WallTime t_after_pack = t_start;
+
         tf::StampedTransform transform;
         try {
-            tf_listener.lookupTransform("/odom", "/base_link", ros::Time(0), transform);
+            tf_listener.lookupTransform(odom_frame_, base_frame_, ros::Time(0), transform);
         } catch (tf::TransformException& ex) {
             ROS_WARN_THROTTLE(1.0, "TF lookup failed: %s", ex.what());
             return;
         }
+        t_after_tf = ros::WallTime::now();
 
         double tx  = transform.getOrigin().x();
         double ty  = transform.getOrigin().y();
@@ -87,7 +131,7 @@ public:
         double x_map_to_chassis = tx - map_origin[0];
         double y_map_to_chassis = ty - map_origin[1];
 
-        double half = BOX_HALFLENGTH / 2.0;
+        double half = std::max(0.0, bbox_length_) / 2.0;
         double tl_x = x_map_to_chassis - half,  tl_y = y_map_to_chassis - half;
         double br_x = x_map_to_chassis + half,  br_y = y_map_to_chassis + half;
 
@@ -104,6 +148,38 @@ public:
         itly = std::max(0, std::min(itly, H - 1));
         ibrx = std::max(0, std::min(ibrx, W - 1));
         ibry = std::max(0, std::min(ibry, H - 1));
+        t_after_bbox = ros::WallTime::now();
+
+        if (bbox_viz_enabled_) {
+            const double x_min = tl_x + map_origin[0];
+            const double y_min = tl_y + map_origin[1];
+            const double x_max = br_x + map_origin[0];
+            const double y_max = br_y + map_origin[1];
+
+            visualization_msgs::Marker bbox;
+            bbox.header.frame_id = odom_frame_;
+            bbox.header.stamp = ros::Time::now();
+            bbox.ns = "map_cloud_bbox";
+            bbox.id = 0;
+            bbox.type = visualization_msgs::Marker::LINE_STRIP;
+            bbox.action = visualization_msgs::Marker::ADD;
+            bbox.pose.orientation.w = 1.0;
+            bbox.scale.x = 0.03;
+            bbox.color.a = 1.0;
+            bbox.color.r = 0.1f;
+            bbox.color.g = 0.7f;
+            bbox.color.b = 1.0f;
+
+            geometry_msgs::Point p;
+            p.z = 0.05;
+            p.x = x_min; p.y = y_min; bbox.points.push_back(p);
+            p.x = x_max; p.y = y_min; bbox.points.push_back(p);
+            p.x = x_max; p.y = y_max; bbox.points.push_back(p);
+            p.x = x_min; p.y = y_max; bbox.points.push_back(p);
+            p.x = x_min; p.y = y_min; bbox.points.push_back(p);
+
+            pub_bbox_marker_.publish(bbox);
+        }
 
         // -----------------------------------------------------------------------
         // Angle bins
@@ -169,12 +245,13 @@ public:
                 };
             }
         }
+        t_after_bin_loop = ros::WallTime::now();
 
         // -----------------------------------------------------------------------
         // Build PointCloud2
         // -----------------------------------------------------------------------
         sensor_msgs::PointCloud2 pointcloud;
-        pointcloud.header.frame_id = "odom";
+        pointcloud.header.frame_id = odom_frame_;
         pointcloud.header.stamp    = ros::Time::now();
         pointcloud.height          = 1;
         pointcloud.is_dense        = false;
@@ -183,6 +260,7 @@ public:
         int valid_count = 0;
         for (int i = 0; i < num_angles; ++i)
             if (points_dist[i] != std::numeric_limits<double>::infinity()) ++valid_count;
+        t_after_count = ros::WallTime::now();
 
         sensor_msgs::PointCloud2Modifier modifier(pointcloud);
         modifier.setPointCloud2Fields(4,
@@ -206,9 +284,24 @@ public:
             *out_i = 1.0f;
             ++out_x; ++out_y; ++out_z; ++out_i;
         }
+        t_after_pack = ros::WallTime::now();
 
         pub_point_cloud.publish(pointcloud);
         ROS_INFO_THROTTLE(2.0, "Published %d map-cloud points", valid_count);
+
+        if (bench_log_enabled_) {
+            const auto t_end = ros::WallTime::now();
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][occupancy_to_cloud][run] total=" << (t_end - t_start).toSec() * 1e3 << " ms"
+                << " | tf_lookup=" << (t_after_tf - t_start).toSec() * 1e3 << " ms"
+                << " | bbox_indexing=" << (t_after_bbox - t_after_tf).toSec() * 1e3 << " ms"
+                << " | obstacle_bin_loop=" << (t_after_bin_loop - t_after_bbox).toSec() * 1e3 << " ms"
+                << " | valid_bin_count=" << (t_after_count - t_after_bin_loop).toSec() * 1e3 << " ms"
+                << " | pack_cloud=" << (t_after_pack - t_after_count).toSec() * 1e3 << " ms"
+                << " | publish=" << (t_end - t_after_pack).toSec() * 1e3 << " ms"
+                << " | bins=" << num_angles
+                << " | valid=" << valid_count);
+        }
     }
 };
 

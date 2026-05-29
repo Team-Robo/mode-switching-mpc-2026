@@ -87,5 +87,10 @@ source ~/acados_env/bin/activate
 pip install --upgrade pip setuptools wheel
 ```
 
-## TODO: edit `CMakeList.txt` & `package.xml` currently `tf2` is not included but used and `python3-casadi` in package.xml is can't be resolved by `rosdep`
+## Note on Python dependencies
+
+`acados` and `casadi` cannot be installed via `rosdep` and are not declared in
+`package.xml`. They are installed manually by `script/setup_acados_mpc.sh`
+(step 5 above). If you skip the setup script, the build will fail at link time
+with missing acados symbols.
 

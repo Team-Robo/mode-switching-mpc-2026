@@ -13,8 +13,8 @@ private:
     const std::string TOPIC_CMD_VEL = "/cmd_vel";
     const std::string TOPIC_FRONT_SCAN = "/front/scan";
     const std::string TOPIC_LOCAL_FOOTPRINT = "/move_base/local_costmap/footprint";
-    const std::string TOPIC_GLOBAL_PLAN = "/move_base/TrajectoryPlannerROS/global_plan";
-    const std::string TOPIC_LOCAL_PLAN = "/move_base/TrajectoryPlannerROS/local_plan";
+    const std::string TOPIC_GLOBAL_PLAN = "/move_base/NavfnROS/plan";
+    const std::string TOPIC_LOCAL_PLAN = "/mpc_plan";
     const std::string TOPIC_ODOM = "/odometry/filtered";
     const std::string TOPIC_MPC = "/mpc_plan";
     

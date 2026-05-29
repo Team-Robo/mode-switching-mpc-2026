@@ -1,0 +1,69 @@
+# Loaded under move_base with ns MpcLocalPlannerROS (private ~ params).
+position_weight_mult_dynamic: 0.7000000000000001
+heading_weight_mult_dynamic: 0.44999999999999996
+accel_weight_mult_dynamic: 4.9711669468300554
+vel_weight_mult_dynamic: 1.113057650495854
+
+weight_position_error: 155.0
+weight_heading_error: 92.0
+weight_velocity: 50.0
+weight_acceleration: 0.0003088547426299309
+static_obs_safe_dist: 1.2
+
+min_spacing_global_plan: 0.05
+
+v_linear_max: 2.0
+v_ref_static: 0.4
+omega_max: 2.5
+
+retry_profile_enabled: false
+retry_profile_max_attempts: 1
+retry_v_ref_scale: 0.7
+retry_heading_weight_scale: 0.7
+retry_accel_weight_scale: 1.5
+solver_fail_hold_enabled: true
+solver_fail_hold_max_cycles: 3
+solver_fail_hold_decay: 0.7
+
+dynamic_obs_safe_dist: 8.8
+dynamic_obs_timeout: 0.35
+
+dyn_plan_influence_dist: 4.0
+dyn_plan_margin: 0.25
+dyn_plan_max_lateral_shift: 1.2
+dyn_plan_smoothing: 0.35
+
+enable_heading_smoothing: true
+
+rush_goal_dist: 4.0
+rush_goal_exit_dist: 0.8
+
+reversal_threshold: 0.9
+reversal_angle_deg: 85.0
+
+lidar_blind_angle_deg: 45.0
+shim_exit_heading_deg: 90.0
+shim_omega: 0.4
+
+obs_search_radius: 5.0
+
+bench_log_enabled: true
+bench_log_period_s: 1.0
+
+enable_startup_scan: false
+
+xy_goal_tolerance: 0.25
+yaw_goal_tolerance: 0.157
+
+enable_rotate_to_goal: true
+rotate_to_goal_kp: 1.8
+rotate_to_goal_max_w: 0.6
+rotate_to_goal_min_w: 0.15
+rotate_to_goal_lookahead_s: 0.8
+rotate_to_goal_yaw_step_deg: 5.0
+rotate_to_goal_block_unknown: true
+
+odom_frame: odom
+
+robot_radius: 0.22
+safety_margin: 0.03

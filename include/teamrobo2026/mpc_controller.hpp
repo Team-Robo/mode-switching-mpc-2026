@@ -1,12 +1,13 @@
-#ifndef MPC_NODE_HPP
-#define MPC_NODE_HPP
-// mpc_node.hpp
+#ifndef MPC_CONTROLLER_HPP
+#define MPC_CONTROLLER_HPP
+// mpc_controller.hpp
 
 #include <ros/ros.h>
 #include <nav_msgs/Path.h>
 #include <nav_msgs/Odometry.h>
 #include <geometry_msgs/Twist.h>
 #include <geometry_msgs/PoseStamped.h>
+#include <tf2_ros/buffer.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <visualization_msgs/Marker.h>
 #include <sensor_msgs/point_cloud2_iterator.h>
@@ -16,10 +17,6 @@
 #include <string>
 #include <cmath>
 #include <memory>
-#include <mutex>
-#include <pcl/point_types.h>
-#include <pcl/kdtree/kdtree_flann.h>
-#include <pcl/point_cloud.h>
 
 // ACADOS interface
 extern "C" {
@@ -45,13 +42,22 @@ struct PredictedObstacle {
     std::vector<double> radius_predicted;
 };
 
+enum class StartupScanPhase {
+    IDLE,
+    SCAN_LEFT,    // rotate CCW 45°
+    SCAN_RIGHT,   // rotate CW  90°
+    SCAN_CENTER,  // rotate CCW 45° back to origin
+    DONE
+};
+
 // Priority: DYNAMIC_OBS > ROTATION_SHIM > RUSH_GOAL > STATIC_OBS > NORMAL
 // ROTATION_SHIM fires when a reversal is needed but the goal direction falls
 // inside the lidar blind zone — the robot spins in place until the goal is
 // visible, then hands off to normal reversal.
+
 enum class ControlMode {
     NORMAL,          // No obstacles nearby — full speed cap (v_linear_max_)
-    STATIC_OBS,      // Static obstacles detected — hard-capped at v_static_obs_max_
+    STATIC_OBS,      // Static obstacles detected — normal hard caps, lower speed reference
     DYNAMIC_OBS,     // Dynamic obstacles detected — full speed, higher accel weight
     RUSH_GOAL,       // Near goal while static obs present — blast at v_linear_max_,
                      // obstacles cleared from ACADOS params, heavy position weight
@@ -59,46 +65,59 @@ enum class ControlMode {
                      // rotation until goal enters FOV, then releases to reversal
 };
 
-class MPCNode {
+class MpcController {
 public:
-    MPCNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private);
-    ~MPCNode();
+    MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private);
+    ~MpcController();
 
-    void run();
+    /** One control cycle: fills cmd_vel and returns false if no valid command. */
+    bool runOnce(geometry_msgs::Twist& cmd_vel);
+
+    /** Global plan from move_base (transformed into odom_frame_). */
+    bool setPlan(const std::vector<geometry_msgs::PoseStamped>& plan, tf2_ros::Buffer* tf);
+
+    bool isGoalReached(double xy_tolerance, double yaw_tolerance) const;
+    bool getGoalPose(double& gx, double& gy, double& gyaw) const;
+
+    bool solverReady() const { return solver_ready_; }
+
+    void updateRobotPose(const geometry_msgs::PoseStamped& pose);
 
 private:
     ros::NodeHandle nh_;
     ros::NodeHandle nh_private_;
 
-    // Publishers
-    ros::Publisher pub_vel_;
+    // Publishers (debug)
     ros::Publisher pub_mpc_plan_;
     ros::Publisher pub_marker_;
 
-    std::mutex solver_mutex_;
-
     // Subscribers
     ros::Subscriber sub_odom_;
-    ros::Subscriber sub_global_plan_;
     ros::Subscriber sub_cloud_;
     ros::Subscriber sub_map_cloud_;
     ros::Subscriber sub_dynamic_obstacle_;
 
+    bool solver_ready_ = false;
+
     // Callbacks
     void callbackOdom(const nav_msgs::Odometry::ConstPtr& msg);
-    void callbackGlobalPlan(const nav_msgs::Path::ConstPtr& msg);
     void callbackCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackMapCloud(const sensor_msgs::PointCloud2::ConstPtr& msg);
     void callbackTrackDynamicObstacle(const obstacle_detector::Obstacles::ConstPtr& msg);
 
+    void ingestGlobalPlan(const std::vector<double>& xs, const std::vector<double>& ys);
+    void writeVelocityCommand(double v, double w, geometry_msgs::Twist& cmd_vel) const;
+    void recordLastValidCommand(double v, double w);
+    bool applySolveFailureFallback(geometry_msgs::Twist& cmd_vel);
+
     // ACADOS
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
-    ocp_nlp_config* nlp_config_;
-    ocp_nlp_dims*   nlp_dims_;
-    ocp_nlp_in*     nlp_in_;
-    ocp_nlp_out*    nlp_out_;
-    ocp_nlp_solver* nlp_solver_;
-    void*           nlp_opts_;
+    ocp_nlp_config* nlp_config_ = nullptr;
+    ocp_nlp_dims*   nlp_dims_   = nullptr;
+    ocp_nlp_in*     nlp_in_     = nullptr;
+    ocp_nlp_out*    nlp_out_    = nullptr;
+    ocp_nlp_solver* nlp_solver_ = nullptr;
+    void*           nlp_opts_   = nullptr;
 
     void initializeAcadosSolver();
     void cleanupAcadosSolver();
@@ -110,19 +129,19 @@ private:
                   const std::vector<double>& obs_x,
                   const std::vector<double>& obs_y);
 
-    void publishVelocity(double v, double w);
     void publishTrajectory(const std::vector<double>& x_traj,
                            const std::vector<double>& y_traj);
     void publishMarker();
+    bool runStartupScan(geometry_msgs::Twist& cmd_vel);
 
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
-    double headingPreprocess(double center, double target);
+    double headingPreprocess(double center, double target) const;
     double diffAngle(double a1, double a2) const;
     void   findClosestPoint(const std::vector<double>& x_ref,
                             const std::vector<double>& y_ref,
                             double curr_x, double curr_y, int& min_idx);
-    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy);
+    bool   isLeft(double rx, double ry, double rtheta, double ox, double oy) const;
 
     // Reversal
     bool checkReversalNeeded(const std::vector<double>& theta_ref, double current_theta);
@@ -135,17 +154,35 @@ private:
     std::vector<PredictedObstacle> predictObstaclesTrajectory(
         const std::vector<DynamicObstacle>& obstacles, double dt, int N);
 
+    // Dynamic behavior planning: locally deform reference path to route around
+    // predicted moving obstacles before passing references to ACADOS.
+    void applyDynamicBehaviorPlanning(
+        std::vector<double>& x_ref,
+        std::vector<double>& y_ref,
+        const std::vector<PredictedObstacle>& predicted_obstacles,
+        const std::vector<double>& current_state,
+        double dt) const;
+    std::vector<double> buildHeadingRefFromPath(
+        const std::vector<double>& x_ref,
+        const std::vector<double>& y_ref,
+        double current_heading) const;
+
+    std::vector<double> buildSmoothedHeadingRefFromPath(
+        const std::vector<double>& x_ref,
+        const std::vector<double>& y_ref,
+        double current_heading) const;
+
     // =========================================================================
-    // Obstacle selection
+    // Obstacle selection — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic (24 params)
     // =========================================================================
-    void selectTwoObstacles(
+    void selectObstacles(
         const std::vector<double>& obs_x,
         const std::vector<double>& obs_y,
         const std::vector<PredictedObstacle>& predicted_obstacles,
-        double rx, double ry,
+        double rx, double ry, double rtheta,
         int stage,
         double search_radius_sq,
-        double p_data[4]) const;
+        double p_data[24]) const;
 
     // Emergency stop for 3rd+ dynamic obstacle
     bool checkEmergencyStop(
@@ -157,6 +194,7 @@ private:
     // =========================================================================
     double distToGoal(double rx, double ry) const;
     void warmStartFromCurrentState(const std::vector<double>& current_state);
+    void clampWarmSolutionToVcap(double v_cap, double omega_cap);
 
     // =========================================================================
     // ROTATION_SHIM helpers
@@ -179,6 +217,11 @@ private:
     int N_  = 20;
     int nx_ = 5;
     int nu_ = 2;
+    
+    // =========================================================================
+    // Path progress tracking
+    // =========================================================================
+    int path_progress_idx_ = 0;
 
     // =========================================================================
     // Optuna-tunable parameters — all loaded via nh_private_ / ROS param server
@@ -186,36 +229,38 @@ private:
 
     // --- Velocity limits ---
     double v_linear_max_      = 2.0;   // [m/s] cap for NORMAL & DYNAMIC_OBS & RUSH_GOAL
-    double v_static_obs_max_  = 0.9;   // [m/s] cap for STATIC_OBS
+    double v_ref_static_      = 1.0;   // [m/s] reference speed target for STATIC_OBS
     double omega_max_         = 1.8;   // [rad/s] shared limit
-    double omega_static_obs_max_ = 0.8; // [rad/s] cap for STATIC_OBS
 
     // --- Stage cost weights ---
-    double weight_position_error_ = 49.0;
-    double weight_heading_error_  = 37.0;
-    double weight_acceleration_   = 0.0021;
-    double weight_velocity_       = 10.0;
+    double weight_position_error_ = 128.0;
+    double weight_heading_error_  = 57.0;
+    double weight_acceleration_   = 0.01803665193219243;
+    double weight_velocity_       = 33.0;
 
     double accel_weight_mult_static_  = 5.0;
-    double accel_weight_mult_dynamic_ = 3.0;
+    double accel_weight_mult_dynamic_ = 4.9711669468300554;
+    double position_weight_mult_dynamic_ = 0.7000000000000001;
+    double heading_weight_mult_dynamic_  = 0.44999999999999996;
+    double vel_weight_mult_dynamic_      = 1.113057650495854;
 
     // --- Mode trigger distances ---
     double static_obs_safe_dist_   = 1.25;
-    double dynamic_obs_safe_dist_  = 2.5;
+    double dynamic_obs_safe_dist_  = 8.8;
 
     // --- Obstacle geometry ---
     double robot_radius_       = 0.35;
     double dynamic_obs_radius_ = 0.5;
     double safety_margin_      = 0.1;
-    double obs_search_radius_  = 4.0;
+    double obs_search_radius_  = 5.0;
 
     // --- Reversal detection ---
-    double reversal_threshold_ = 0.7;
-    double reversal_angle_deg_ = 90.0;
+    double reversal_threshold_ = 0.9;
+    double reversal_angle_deg_ = 85.0;
 
     // --- RUSH_GOAL ---
-    double rush_goal_dist_      = 4.0;
-    double rush_goal_exit_dist_ = 0.5;
+    double rush_goal_dist_      = 4.6;
+    double rush_goal_exit_dist_ = 0.8;
     double rush_weight_position_   = 5000.0;
     double rush_weight_heading_    = 6000.0;
     double rush_weight_velocity_   = 50000.0;
@@ -227,12 +272,12 @@ private:
     // --- ROTATION_SHIM ---
     // Half-angle (degrees) of the lidar blind zone centred on the robot rear.
     // For a 270° FOV lidar the dead zone spans 90°, so half-angle = 45°.
-    double lidar_blind_angle_deg_ = 45.0;
+    double lidar_blind_angle_deg_ = 39.0;
     // Exit shim once the goal has moved this many degrees clear of the blind edge
     // (set to 0 for no hysteresis, positive for a small angular buffer).
-    double shim_exit_heading_deg_ = 30.0;
+    double shim_exit_heading_deg_ = 15.0;
     // Rotation speed commanded during ROTATION_SHIM [rad/s]
-    double shim_omega_            = 1.2;
+    double shim_omega_            = 0.8;
     // Runtime state: whether shim is currently engaged and which way to turn
     bool   shim_active_     = false;
     bool   shim_turn_left_  = true;
@@ -241,6 +286,10 @@ private:
     // Runtime state
     // =========================================================================
     std::vector<double> current_state_;   // [x, y, theta, vr, vl]
+    bool goal_pose_valid_ = false;
+    double goal_x_ = 0.0;
+    double goal_y_ = 0.0;
+    double goal_yaw_ = 0.0;
 
     std::vector<double> og_x_ref_, og_y_ref_, theta_ref_;
     std::vector<double> x_ref_, y_ref_;
@@ -249,16 +298,58 @@ private:
     std::vector<double> obs_x_, obs_y_;
     std::vector<double> map_x_, map_y_;
 
-    // Cached KD-tree for static obstacles (rebuilt on each cloud callback)
-    pcl::PointCloud<pcl::PointXYZ>::Ptr static_obs_cloud_;
-    pcl::KdTreeFLANN<pcl::PointXYZ>    static_obs_kdtree_;
-    bool                                static_obs_kdtree_valid_ = false;
-    void rebuildStaticKdtree();
-
     ros::Time last_dynamic_obs_time_;
-    double dynamic_obs_timeout_ = 0.5;
+    double dynamic_obs_timeout_ = 0.35;
+
+    // Dynamic behavior-planning knobs
+    double dyn_plan_influence_dist_ = 3.5;
+    double dyn_plan_margin_ = 0.25;
+    double dyn_plan_max_lateral_shift_ = 1.2;
+    double dyn_plan_smoothing_ = 0.35;
+
+    // Heading-reference smoothing knobs
+    bool   enable_heading_smoothing_ = true;
+    double heading_lookahead_dist_ = 0.5;   // [m] arc-length look-ahead for tangent estimate
+    double heading_smooth_alpha_   = 0.45;  // low-pass factor: 0 = hold, 1 = raw
+    double heading_max_dtheta_deg_ = 25.0;  // max heading change per MPC stage [deg]
+
+    bool               enable_startup_scan_   = false;
+    bool               startup_scan_done_     = false;
+    StartupScanPhase   startup_scan_phase_    = StartupScanPhase::IDLE;
+    double             startup_scan_start_yaw_ = 0.0;
+
+    static constexpr double STARTUP_SCAN_OMEGA = 0.6;
+    static constexpr double STARTUP_SCAN_STEP  = M_PI / 4.0;  // 45 degrees
+
+    // Minimum spacing (meters) when subsampling the global plan for MPC refs.
+    double min_spacing_global_plan_ = 0.14;
+
+    // Failure retry profile (applied to STATIC_OBS/NORMAL on retry solve only)
+    bool   retry_profile_enabled_ = true;
+    int    retry_profile_max_attempts_ = 1;
+    double retry_v_ref_scale_ = 0.7;
+    double retry_heading_weight_scale_ = 0.7;
+    double retry_accel_weight_scale_ = 1.5;
+    bool   retry_profile_active_ = false;
+
+    // If solve fails, hold the last valid command briefly before stopping.
+    bool   solver_fail_hold_enabled_ = true;
+    int    solver_fail_hold_max_cycles_ = 3;
+    double solver_fail_hold_decay_ = 0.7;
+    int    solver_fail_count_ = 0;
+    bool   has_last_valid_cmd_ = false;
+    double last_valid_v_cmd_ = 0.0;
+    double last_valid_w_cmd_ = 0.0;
+
+    // TF frame for published trajectories / markers
+    std::string odom_frame_ = "odom";
+
+    // Benchmark logging controls
+    bool   bench_log_enabled_   = true;
+    double bench_log_period_s_  = 1.0;
 
     ControlMode mode_        = ControlMode::NORMAL;
+    ControlMode prev_mode_   = ControlMode::NORMAL;
     bool        in_reversal_ = false;
     std::string display_text_;
 
@@ -270,4 +361,4 @@ private:
 
 } // namespace mpc_controller
 
-#endif // MPC_NODE_HPP
+#endif // MPC_CONTROLLER_HPP

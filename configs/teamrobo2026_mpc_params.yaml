@@ -1,0 +1,17 @@
+lidar_filter:
+  source_topic: /front/scan
+  pub_topic: /front/scan_filtered
+  outlier_threshold: 0.02
+
+
+laser_scan_to_point_cloud:
+  # Overridden in move_base_mlda_2026.launch from enable_lidar_filter (filtered vs raw).
+  scan_topic: /front/scan_filtered
+  bench_log_enabled: false
+  bench_log_period_s: 1.0
+
+map_to_cloud:
+  bench_log_enabled: false
+  bench_log_period_s: 1.0
+  bbox_length: 3.0
+  bbox_viz_enabled: true

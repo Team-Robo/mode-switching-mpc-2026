@@ -1,0 +1,5 @@
+<library path="lib/libteamrobo2026_mpc_planner">
+  <class name="teamrobo2026/MpcLocalPlannerROS" type="mpc_controller::MpcLocalPlannerROS" base_class_type="nav_core::BaseLocalPlanner">
+    <description>Mode-switching MPC local planner (ACADOS) for Jackal diff-drive.</description>
+  </class>
+</library>
