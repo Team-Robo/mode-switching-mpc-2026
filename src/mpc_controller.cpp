@@ -87,6 +87,7 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("dyn_plan_max_lateral_shift", dyn_plan_max_lateral_shift_, 1.2);
     nh_private_.param<double>("dyn_plan_smoothing", dyn_plan_smoothing_, 0.35);
 
+    nh_private_.param<bool>("enable_heading_smoothing", enable_heading_smoothing_, true);
     nh_private_.param<double>("heading_lookahead_dist", heading_lookahead_dist_, 0.5);
     nh_private_.param<double>("heading_smooth_alpha",   heading_smooth_alpha_,   0.45);
     nh_private_.param<double>("heading_max_dtheta_deg", heading_max_dtheta_deg_, 25.0);
@@ -130,6 +131,9 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     ROS_INFO("  Dynamic obs hysteresis timeout: %.2f s", dynamic_obs_timeout_);
     ROS_INFO("  Dynamic behavior plan: influence=%.2f m  margin=%.2f m  max_shift=%.2f m  smooth=%.2f",
              dyn_plan_influence_dist_, dyn_plan_margin_, dyn_plan_max_lateral_shift_, dyn_plan_smoothing_);
+    ROS_INFO("  Heading smoothing: enabled=%s lookahead=%.2f m alpha=%.2f max_dtheta=%.1f deg",
+             enable_heading_smoothing_ ? "true" : "false",
+             heading_lookahead_dist_, heading_smooth_alpha_, heading_max_dtheta_deg_);
     ROS_INFO("  Global plan min spacing: %.2f m", min_spacing_global_plan_);
     ROS_INFO("  Retry profile: enabled=%s attempts=%d vref_scale=%.2f heading_scale=%.2f accel_scale=%.2f",
              retry_profile_enabled_ ? "true" : "false",
@@ -1619,8 +1623,14 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         const auto predicted_for_behavior = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
         applyDynamicBehaviorPlanning(x_ref_, y_ref_, predicted_for_behavior, current_state_, dt);
 
-        std::vector<double> theta_sub = buildSmoothedHeadingRefFromPath(
-            x_ref_, y_ref_, current_state_[2]);
+        std::vector<double> theta_sub;
+        if (enable_heading_smoothing_) {
+            theta_sub = buildSmoothedHeadingRefFromPath(
+                x_ref_, y_ref_, current_state_[2]);
+        } else {
+            theta_sub = buildHeadingRefFromPath(
+                x_ref_, y_ref_, current_state_[2]);
+        }
         while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
             theta_sub.push_back(theta_sub.back());
         if (goal_pose_valid_ && !theta_sub.empty()) {

@@ -308,6 +308,7 @@ private:
     double dyn_plan_smoothing_ = 0.35;
 
     // Heading-reference smoothing knobs
+    bool   enable_heading_smoothing_ = true;
     double heading_lookahead_dist_ = 0.5;   // [m] arc-length look-ahead for tangent estimate
     double heading_smooth_alpha_   = 0.45;  // low-pass factor: 0 = hold, 1 = raw
     double heading_max_dtheta_deg_ = 25.0;  // max heading change per MPC stage [deg]

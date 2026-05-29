@@ -31,6 +31,8 @@ dyn_plan_margin: 0.25
 dyn_plan_max_lateral_shift: 1.2
 dyn_plan_smoothing: 0.35
 
+enable_heading_smoothing: true
+
 rush_goal_dist: 4.0
 rush_goal_exit_dist: 0.8
 
