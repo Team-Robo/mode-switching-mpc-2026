@@ -87,6 +87,10 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("dyn_plan_max_lateral_shift", dyn_plan_max_lateral_shift_, 1.2);
     nh_private_.param<double>("dyn_plan_smoothing", dyn_plan_smoothing_, 0.35);
 
+    nh_private_.param<double>("heading_lookahead_dist", heading_lookahead_dist_, 0.5);
+    nh_private_.param<double>("heading_smooth_alpha",   heading_smooth_alpha_,   0.45);
+    nh_private_.param<double>("heading_max_dtheta_deg", heading_max_dtheta_deg_, 25.0);
+
     nh_private_.param<double>("min_spacing_global_plan", min_spacing_global_plan_, 0.14);
     nh_private_.param<bool>("retry_profile_enabled", retry_profile_enabled_, true);
     nh_private_.param<int>("retry_profile_max_attempts", retry_profile_max_attempts_, 1);
@@ -578,6 +582,53 @@ std::vector<double> MpcController::buildHeadingRefFromPath(
     }
     theta_ref.push_back(theta_ref.back());
     return theta_ref;
+}
+
+std::vector<double> MpcController::buildSmoothedHeadingRefFromPath(
+    const std::vector<double>& x_ref,
+    const std::vector<double>& y_ref,
+    double current_heading) const
+{
+    std::vector<double> theta;
+    if (x_ref.empty() || y_ref.empty()) return theta;
+
+    const size_t n = std::min(x_ref.size(), y_ref.size());
+    theta.resize(n, current_heading);
+
+    const double max_dtheta = heading_max_dtheta_deg_ * M_PI / 180.0;
+    double prev = current_heading;
+
+    for (size_t i = 0; i + 1 < n; ++i) {
+        // Walk forward until accumulated arc-length >= heading_lookahead_dist_
+        size_t j = i + 1;
+        double acc_dist = 0.0;
+        while (j + 1 < n && acc_dist < heading_lookahead_dist_) {
+            acc_dist += std::hypot(x_ref[j] - x_ref[j - 1], y_ref[j] - y_ref[j - 1]);
+            ++j;
+        }
+
+        const double dx = x_ref[j] - x_ref[i];
+        const double dy = y_ref[j] - y_ref[i];
+
+        // Repeated / padded goal points → hold previous heading
+        if (std::hypot(dx, dy) < 1e-4) {
+            theta[i] = prev;
+            continue;
+        }
+
+        // wrap_pi(raw - prev), then low-pass, then rate-limit
+        // headingPreprocess(center, target) returns target unwrapped into (center-pi, center+pi]
+        const double raw   = std::atan2(dy, dx);
+        double delta       = headingPreprocess(prev, raw) - prev;  // in (-pi, pi]
+        delta             *= heading_smooth_alpha_;
+        delta              = std::max(-max_dtheta, std::min(max_dtheta, delta));
+
+        theta[i] = prev + delta;
+        prev = theta[i];
+    }
+
+    theta[n - 1] = prev;
+    return theta;
 }
 
 // =============================================================================
@@ -1521,7 +1572,7 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         const auto predicted_for_behavior = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
         applyDynamicBehaviorPlanning(x_ref_, y_ref_, predicted_for_behavior, current_state_, dt);
 
-        std::vector<double> theta_sub = buildHeadingRefFromPath(
+        std::vector<double> theta_sub = buildSmoothedHeadingRefFromPath(
             x_ref_, y_ref_, current_state_[2]);
         while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
             theta_sub.push_back(theta_sub.back());

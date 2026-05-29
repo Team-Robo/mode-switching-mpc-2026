@@ -165,6 +165,11 @@ private:
         const std::vector<double>& y_ref,
         double current_heading) const;
 
+    std::vector<double> buildSmoothedHeadingRefFromPath(
+        const std::vector<double>& x_ref,
+        const std::vector<double>& y_ref,
+        double current_heading) const;
+
     // =========================================================================
     // Obstacle selection — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic (24 params)
     // =========================================================================
@@ -299,6 +304,11 @@ private:
     double dyn_plan_margin_ = 0.25;
     double dyn_plan_max_lateral_shift_ = 1.2;
     double dyn_plan_smoothing_ = 0.35;
+
+    // Heading-reference smoothing knobs
+    double heading_lookahead_dist_ = 0.5;   // [m] arc-length look-ahead for tangent estimate
+    double heading_smooth_alpha_   = 0.45;  // low-pass factor: 0 = hold, 1 = raw
+    double heading_max_dtheta_deg_ = 25.0;  // max heading change per MPC stage [deg]
 
     bool               enable_startup_scan_   = false;
     bool               startup_scan_done_     = false;
