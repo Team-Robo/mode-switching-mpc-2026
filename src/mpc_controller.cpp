@@ -97,9 +97,15 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
     nh_private_.param<double>("retry_v_ref_scale", retry_v_ref_scale_, 0.7);
     nh_private_.param<double>("retry_heading_weight_scale", retry_heading_weight_scale_, 0.7);
     nh_private_.param<double>("retry_accel_weight_scale", retry_accel_weight_scale_, 1.5);
+    nh_private_.param<bool>("solver_fail_hold_enabled", solver_fail_hold_enabled_, true);
+    nh_private_.param<int>("solver_fail_hold_max_cycles", solver_fail_hold_max_cycles_, 3);
+    nh_private_.param<double>("solver_fail_hold_decay", solver_fail_hold_decay_, 0.7);
     nh_private_.param<std::string>("odom_frame", odom_frame_, std::string("odom"));
     nh_private_.param<bool>("bench_log_enabled", bench_log_enabled_, true);
     nh_private_.param<double>("bench_log_period_s", bench_log_period_s_, 1.0);
+
+    solver_fail_hold_max_cycles_ = std::max(0, solver_fail_hold_max_cycles_);
+    solver_fail_hold_decay_ = std::max(0.0, std::min(1.0, solver_fail_hold_decay_));
 
     ROS_INFO("=== MPC Node Parameters ===");
     ROS_INFO("  Startup scan: %s (fixed sweep ±45° / 90° @ %.1f rad/s)",
@@ -129,6 +135,9 @@ MpcController::MpcController(ros::NodeHandle& nh, ros::NodeHandle& nh_private)
              retry_profile_enabled_ ? "true" : "false",
              retry_profile_max_attempts_, retry_v_ref_scale_,
              retry_heading_weight_scale_, retry_accel_weight_scale_);
+    ROS_INFO("  Solve-fail hold: enabled=%s max_cycles=%d decay=%.2f",
+             solver_fail_hold_enabled_ ? "true" : "false",
+             solver_fail_hold_max_cycles_, solver_fail_hold_decay_);
     ROS_INFO("  Safety settings: robot_radius=%.2f m  dynamic_obs_radius=%.2f m  safety_margin=%.2f m obs_search_radius=%.2f m",
              robot_radius_, dynamic_obs_radius_, safety_margin_, obs_search_radius_);
     ROS_INFO("  Bench logging: enabled=%s  period=%.2f s",
@@ -1449,6 +1458,44 @@ void MpcController::writeVelocityCommand(double v, double w, geometry_msgs::Twis
     cmd_vel.angular.z = w;
 }
 
+void MpcController::recordLastValidCommand(double v, double w) {
+    if (!std::isfinite(v) || !std::isfinite(w)) {
+        return;
+    }
+    last_valid_v_cmd_ = v;
+    last_valid_w_cmd_ = w;
+    has_last_valid_cmd_ = true;
+    solver_fail_count_ = 0;
+}
+
+bool MpcController::applySolveFailureFallback(geometry_msgs::Twist& cmd_vel) {
+    solver_fail_count_++;
+
+    const bool within_hold_window =
+        solver_fail_hold_enabled_ &&
+        has_last_valid_cmd_ &&
+        solver_fail_count_ <= solver_fail_hold_max_cycles_;
+
+    if (!within_hold_window) {
+        v_opt_ = 0.0;
+        w_opt_ = 0.0;
+        writeVelocityCommand(0.0, 0.0, cmd_vel);
+        ROS_ERROR("MPC solve failed (count=%d) — stopping robot", solver_fail_count_);
+        return false;
+    }
+
+    const int decay_steps = std::max(0, solver_fail_count_);
+    const double scale = std::pow(solver_fail_hold_decay_, static_cast<double>(decay_steps));
+    const double hold_v = last_valid_v_cmd_ * scale;
+    const double hold_w = last_valid_w_cmd_ * scale;
+    v_opt_ = hold_v;
+    w_opt_ = hold_w;
+    writeVelocityCommand(hold_v, hold_w, cmd_vel);
+    ROS_WARN("MPC solve failed (count=%d) — holding last cmd v=%.3f w=%.3f (scale=%.3f)",
+             solver_fail_count_, hold_v, hold_w, scale);
+    return true;
+}
+
 void MpcController::publishTrajectory(const std::vector<double>& x_traj,
                                 const std::vector<double>& y_traj) {
     nav_msgs::Path path;
@@ -1604,10 +1651,10 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                 success = solveOCP(x_ref_, y_ref_, theta_sub,
                                    current_state_, all_obs_x, all_obs_y);
                 if (success) {
-                    ROS_INFO("MPC retry profile recovered on attempt %d/%d",
+                    ROS_WARN("MPC retry profile recovered on attempt %d/%d",
                              attempt, retry_attempts);
                 } else {
-                    ROS_WARN("MPC retry profile failed on attempt %d/%d",
+                    ROS_ERROR("MPC retry profile failed on attempt %d/%d",
                              attempt, retry_attempts);
                 }
             }
@@ -1631,11 +1678,9 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                 ROS_INFO_THROTTLE(0.5, "[%s] V=%.3f W=%.3f",
                                   display_text_.c_str(), v_opt_, w_opt_);
             }
+            recordLastValidCommand(cmd_vel.linear.x, cmd_vel.angular.z);
         } else {
-            v_opt_ = 0.0; w_opt_ = 0.0;
-            writeVelocityCommand(0.0, 0.0, cmd_vel);
-            ROS_WARN("MPC solve failed — stopping robot");
-            return false;
+            return applySolveFailureFallback(cmd_vel);
         }
 
         if (bench_log_enabled_) {

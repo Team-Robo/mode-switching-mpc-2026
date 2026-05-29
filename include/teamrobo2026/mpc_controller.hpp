@@ -107,6 +107,8 @@ private:
 
     void ingestGlobalPlan(const std::vector<double>& xs, const std::vector<double>& ys);
     void writeVelocityCommand(double v, double w, geometry_msgs::Twist& cmd_vel) const;
+    void recordLastValidCommand(double v, double w);
+    bool applySolveFailureFallback(geometry_msgs::Twist& cmd_vel);
 
     // ACADOS
     jackal_diff_drive_solver_capsule* acados_ocp_capsule_ = nullptr;
@@ -328,6 +330,15 @@ private:
     double retry_heading_weight_scale_ = 0.7;
     double retry_accel_weight_scale_ = 1.5;
     bool   retry_profile_active_ = false;
+
+    // If solve fails, hold the last valid command briefly before stopping.
+    bool   solver_fail_hold_enabled_ = true;
+    int    solver_fail_hold_max_cycles_ = 3;
+    double solver_fail_hold_decay_ = 0.7;
+    int    solver_fail_count_ = 0;
+    bool   has_last_valid_cmd_ = false;
+    double last_valid_v_cmd_ = 0.0;
+    double last_valid_w_cmd_ = 0.0;
 
     // TF frame for published trajectories / markers
     std::string odom_frame_ = "odom";
