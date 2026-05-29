@@ -1,162 +1,73 @@
+# MPC Failure Causes + Parameter Table (Current)
+
+## 1) Possible failure causes
+
+1. **QP MINSTEP / QP non-convergence (`ACADOS_MINSTEP`)**
+   - Current solver config is `SQP_RTI` with `nlp_solver_max_iter=1`; difficult local linearizations can fail in one RTI step.
+2. **Stage-0 hard infeasibility**
+   - Stage-0 state is hard-fixed to measured `current_state` (`lbx=ubx` at stage 0). If measured state conflicts with hard bounds (`v`, `omega`, `vr`, `vl`), solve can fail immediately.
+3. **Hard bound violations**
+   - Hard constraints remain active for `v`, `omega`, wheel speed, and controls (`ar`, `al`) even though obstacle-distance constraints are soft.
+4. **Obstacle-distance pressure**
+   - If predicted/static obstacle geometry plus hard kinematics makes progress infeasible, QP can fail despite soft obstacle slack.
+5. **Invalid numeric data**
+   - NaN/Inf in state, reference, or obstacle parameters can break the NLP/QP.
+6. **Runtime ACADOS call failures**
+   - Any nonzero return in setter/update calls (`lh/uh`, `W`, `yref`, `update_params`) triggers early fail path.
+
+---
+
+## 2) MPC parameter table (constraints, weights, cost/reference)
+
+### 2.1 Constraints
+
+| Parameter | Script value (`generate_acados_solver.py`) | Overwritten in `mpc_controller.cpp`? | Runtime default (controller) |
+|---|---|---|---|
+| Wheel speed bounds (`idxbx=[3,4]`, `lbx/ubx`) | `vr,vl in [-2, 2]` | No | `[-2, 2]` |
+| Control bounds (`idxbu=[0,1]`, `lbu/ubu`) | `ar,al in [-2, 2]` | No | `[-2, 2]` |
+| Nonlinear bound `h[0]` (linear speed) | `[-2, 2]` (via `v_linear_max=2.0`) | Yes (`lh/uh` set every cycle) | `[-v_cap, +v_cap]`; defaults: `v_cap=v_linear_max=2.0` in `NORMAL/STATIC/DYNAMIC/RUSH`, `v_cap=0` in `ROTATION_SHIM` |
+| Nonlinear bound `h[1]` (angular speed) | `[-1.8, 1.8]` (via `omega_max=1.8`) | Yes (`lh/uh` set every cycle) | `[-omega_cap, +omega_cap]`; defaults: `omega_cap=omega_max=1.8` in `NORMAL/STATIC/DYNAMIC/RUSH`, `omega_cap=shim_omega=0.8` in `ROTATION_SHIM` |
+| Nonlinear bounds `h[2..13]` obstacle distance lower bounds | `min_dist_sq=(robot_radius+safety_margin)^2=(0.22+0.01)^2=0.0529` | Yes (`lh` rebuilt every cycle) | Non-dynamic formula: `(robot_radius+safety_margin)^2` default `(0.37+0.01)^2=0.1444`; dynamic formula: `(robot_radius+dynamic_obs_radius+safety_margin)^2` default `(0.37+0.5+0.01)^2=0.7744` |
+| Obstacle soft-constraint indices (`idxsh`) | `idxsh=[2..13]`, `ns=12` | No | Same as script |
+| Obstacle slack weights (`zl/Zl/zu/Zu`) | `zl=1000`, `Zl=1000`, `zu=0`, `Zu=0` | No | Same as script |
+| Initial state (`x0`) | `x0=zeros(nx)` template | Yes | Stage-0 hard-set each cycle to measured `current_state` (`lbx=ubx`) |
+| Runtime obstacle parameter vector (`p`, size 24) | initialized to all `1000.0` | Yes (`update_params` each stage) | Per-stage selected obstacles are injected each cycle |
+
+### 2.2 Weights (stage + terminal cost matrices)
+
+| Parameter | Script value (`generate_acados_solver.py`) | Overwritten in `mpc_controller.cpp`? | Runtime default (controller) |
+|---|---|---|---|
+| Stage cost matrix `W` | diag from `Q=[85,85,41,20]`, `R=[0.005,0.005]` | Yes (`W` set each stage) | `W=diag([pos, pos, heading, vel, accel, accel])` with mode-dependent values below |
+| Terminal cost matrix `W_e` | `diag([85,85,41])` | Yes (`W_e` set at terminal stage) | `W_e=diag([pos, pos, heading])`, mode-dependent (RUSH uses rush weights) |
+| Base position weight | `85` (inside script `Q`) | Yes | `weight_position_error=128.0` |
+| Base heading weight | `41` (inside script `Q`) | Yes | `weight_heading_error=57.0` |
+| Base velocity weight | `20` (inside script `Q`) | Yes | `weight_velocity=33.0` |
+| Base accel weights | `0.005, 0.005` (inside script `R`) | Yes | `weight_acceleration=0.01803665193219243` |
+| STATIC accel multiplier | N/A | Yes | `accel_weight_mult_static=3.0` |
+| DYNAMIC multipliers | N/A | Yes | `position=0.7`, `heading=0.45`, `velocity=1.113057650495854`, `accel=4.9711669468300554` |
+| RUSH absolute weights | N/A | Yes | `rush_weight_position=0.0`, `rush_weight_heading=3030.0`, `rush_weight_velocity=3050.0`, `rush_weight_accel=0.0` |
+| Retry profile scales | N/A | Yes | `retry_v_ref_scale=0.7`, `retry_heading_weight_scale=0.7`, `retry_accel_weight_scale=1.5` (applied on retry path) |
+
+### 2.3 Cost/reference parameters
+
+| Parameter | Script value (`generate_acados_solver.py`) | Overwritten in `mpc_controller.cpp`? | Runtime default (controller) |
+|---|---|---|---|
+| Stage reference `yref` shape | `[x, y, theta, v_ref, 0, 0]` (initialized zeros) | Yes (set per stage online) | Same shape, set each cycle |
+| Terminal reference `yref_e` shape | `[x, y, theta]` (initialized zeros) | Yes (set at stage `N`) | Same shape, set each cycle |
+| `x/y` reference source | N/A (online) | Yes | Built from global plan subsampling with `min_spacing_global_plan=0.14` default |
+| Heading reference (`theta`) | N/A (online) | Yes | Built from path tangent (`buildHeadingRefFromPath`); terminal heading is explicitly aligned to stored `goal_yaw_` |
+| `v_ref` (NORMAL) | N/A (online) | Yes | `v_ref=v_linear_max=2.0` |
+| `v_ref` (STATIC_OBS) | N/A (online) | Yes | `v_ref=clamp(v_ref_static, 0, v_linear_max)` with default `v_ref_static=1.0` |
+| `v_ref` (RUSH_GOAL) | N/A (online) | Yes | `v_ref=rush_vref=2.0` |
+| `v_ref` (ROTATION_SHIM) | N/A (online) | Yes | `v_ref=0.0` |
+| Goal pose/yaw tracking | N/A | Yes | Goal pose is stored from `plan.back()` and used for terminal heading alignment + goal checks |
+
+---
+
+### Ownership quick view
+
+- **Script-only (not runtime-overwritten):**
+  - `lbx/ubx` (wheel speed), `lbu/ubu` (control bounds), `idxsh/ns`, slack weights (`zl/Zl/zu/Zu`).
+- **Script + runtime-overwritten in controller:**
+  - Nonlinear bounds `lh/uh`, `W`, `W_e`, `yref`, `yref_e`, stage-0 initial-state enforcement, runtime obstacle parameter vector `p`.
 # MPC Cheatsheet (Current)
-
-This file summarizes the current behavior and effective parameters of the MPC stack in this repository.
-
-## 1) Solver/codegen status
-
-Primary sources checked:
-
-- `script/generate_acados_solver.py`
-- `src/mpc_controller.cpp`
-- `src/mpc_local_planner_ros.cpp`
-- `configs/mpc_local_planner_params.yaml`
-- `launch/move_base_mlda_2026.launch`
-
-Current ACADOS codegen settings (from `generate_acados_solver.py`):
-
-- Horizon: `N=20`, `Tf=2.0`
-- State: `[x, y, theta, vr, vl]`
-- Control: `[ar, al]`
-- Runtime parameter vector size: `np=24` (2 static + 10 dynamic obstacle points)
-- Solver type: `SQP_RTI`
-- `nlp_solver_max_iter=1`
-- `qp_solver_iter_max=40`
-
-Generated template constraints (before runtime overwrite):
-
-- Wheel speed bounds: `vr, vl in [-2, 2]`
-- Control bounds: `ar, al in [-2, 2]`
-- Nonlinear `h`:
-  - `h[0]=v_linear` in `[-2, 2]`
-  - `h[1]=omega` in `[-1.8, 1.8]`
-  - `h[2..13]=distance_sq` lower-bounded by template `min_dist_sq`
-- Obstacle soft constraints enabled on `h[2..13]` with slack penalty `1000`
-
-## 2) Runtime mode behavior
-
-Current solve-path behavior in `mpc_controller.cpp`:
-
-- `DYNAMIC_OBS` mode logic is disabled (`dynamic_obs_active=false`).
-- `RUSH_GOAL` mode logic is disabled (`rush_goal_latched_=false`).
-- Rotation-shim mode-selection block is commented out (startup scan still uses the label temporarily).
-- Effective solve-time modes are therefore typically:
-  - `NORMAL`
-  - `STATIC_OBS`
-- Reversal is an overlay (heading-reference overlay), not a separate mode.
-
-## 3) Runtime constraints (effective)
-
-The controller overwrites nonlinear bounds (`lh/uh`) every cycle.
-
-| Item | Template value (codegen) | Runtime effective now |
-|---|---|---|
-| `h[0]` linear speed cap | `[-2, 2]` | `[-v_cap, +v_cap]`, where `v_cap=v_linear_max` for both `NORMAL` and `STATIC_OBS` |
-| `h[1]` angular speed cap | `[-1.8, 1.8]` | `[-omega_cap, +omega_cap]`, where `omega_cap=omega_max` for both `NORMAL` and `STATIC_OBS` |
-| `h[2..13]` obstacle distance lower bounds | template `min_dist_sq` | runtime `min_dist_sq=(robot_radius+safety_margin)^2` in active modes |
-| Stage-0 state | template `x0=zeros` | hard-fixed each cycle to measured `current_state` via stage-0 `lbx=ubx` |
-
-Current values with `configs/mpc_local_planner_params.yaml`:
-
-- `robot_radius=0.22`
-- `safety_margin=0.01`
-- active-mode `min_dist_sq=(0.22+0.01)^2=0.0529`
-
-If dynamic mode is re-enabled, code uses:
-
-- `min_dist_sq=(robot_radius+dynamic_obs_radius+safety_margin)^2`
-- with current defaults (`dynamic_obs_radius=0.5` unless set), that is `(0.22+0.5+0.01)^2=0.5329`
-
-Obstacle parameter packing now uses:
-
-- one closest static obstacle on the **left**
-- one closest static obstacle on the **right**
-- up to 10 dynamic obstacles
-
-## 4) References and goal handling
-
-Reference generation path:
-
-- Local reference points are subsampled from global plan.
-- Exact global goal point is explicitly appended if missing.
-- Heading reference is built from path tangent (`buildHeadingRefFromPath`).
-
-Current goal-orientation handling:
-
-- Final goal yaw is stored from `plan.back().pose.orientation`.
-- MPC terminal heading is explicitly forced to goal yaw:
-  - terminal `theta_ref_` is aligned in `setPlan(...)`
-  - `theta_sub.back()` is aligned before `solveOCP(...)`
-- Near-goal rotate branch in `MpcLocalPlannerROS` is also active by config:
-  - `enable_rotate_to_goal: true`
-  - in-place rotation with costmap footprint safety checks
-
-## 5) Cost weights and retry profile
-
-Current base weights from `configs/mpc_local_planner_params.yaml`:
-
-- `weight_position_error=155.0`
-- `weight_heading_error=92.0`
-- `weight_velocity=50.0`
-- `weight_acceleration=0.0003088547426299309`
-
-Multipliers:
-
-- `accel_weight_mult_static` is not set in this YAML (controller default used)
-- `accel_weight_mult_dynamic=4.9711669468300554`
-- `position_weight_mult_dynamic=0.7000000000000001`
-- `heading_weight_mult_dynamic=0.44999999999999996`
-- `vel_weight_mult_dynamic=1.113057650495854`
-
-Retry profile status:
-
-- `retry_profile_enabled=false` in current YAML (disabled unless toggled)
-- When enabled, retry profile applies to `STATIC_OBS` and `NORMAL` for:
-  - heading weight scaling
-  - accel weight scaling
-- `retry_v_ref_scale` affects static-mode `v_ref` path (normal-mode `v_ref` remains `v_linear_max`).
-
-## 6) Key ROS params currently loaded
-
-Loaded under `move_base` namespace `MpcLocalPlannerROS`:
-
-- `configs/mpc_local_planner_params.yaml`
-
-Notable values currently set there:
-
-- `v_ref_static: 0.8`
-- `min_spacing_global_plan: 0.05`
-- `static_obs_safe_dist: 1.2`
-- `dynamic_obs_safe_dist: 8.8`
-- `xy_goal_tolerance: 0.25`
-- `yaw_goal_tolerance: 0.157`
-- `enable_rotate_to_goal: true` and rotate tuning params
-- `bench_log_enabled: false`
-
-Separate node params loaded from `configs/teamrobo2026_mpc_params.yaml`:
-
-- `map_to_cloud.bbox_length: 3.0`
-- `map_to_cloud.bbox_viz_enabled: true`
-
-## 7) Build/runtime linkage note
-
-`CMakeLists.txt` and `package.xml` currently include `base_local_planner` dependencies, and plugin link uses:
-
-- `-Wl,--no-as-needed` before `${catkin_LIBRARIES}`
-- `-Wl,--as-needed` after link list
-
-This is to keep `libbase_local_planner.so` as a required runtime dependency for the local planner plugin.
-
-## 8) Current failure checklist
-
-Even with obstacle soft constraints, solver can fail due to hard constraints and QP numerical issues:
-
-- Stage-0 fixed state can conflict with hard nonlinear limits in that cycle.
-- Hard `omega`/`v` bounds can be violated by measured state transients.
-- RTI single-NLP-step setup (`SQP_RTI`, `nlp_solver_max_iter=1`) is sensitive to poor local linearization.
-- Large heading mismatch and low-speed turning can trigger repeated `ACADOS_MINSTEP`.
-- Invalid numerical inputs (NaN/Inf) still break solve path.
-
-Observed practical pattern:
-
-- bursts of `QP status=3 (MINSTEP)` with `status=4` in controller logs,
-- intermittent recovery next cycle when local linearization/warm-start improves.
