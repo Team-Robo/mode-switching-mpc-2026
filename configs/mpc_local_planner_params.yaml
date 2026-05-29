@@ -19,6 +19,9 @@ retry_profile_max_attempts: 1
 retry_v_ref_scale: 0.7
 retry_heading_weight_scale: 0.7
 retry_accel_weight_scale: 1.5
+solver_fail_hold_enabled: true
+solver_fail_hold_max_cycles: 3
+solver_fail_hold_decay: 0.7
 
 dynamic_obs_safe_dist: 8.8
 dynamic_obs_timeout: 0.35

@@ -63,11 +63,3 @@
 | Goal pose/yaw tracking | N/A | Yes | Goal pose is stored from `plan.back()` and used for terminal heading alignment + goal checks |
 
 ---
-
-### Ownership quick view
-
-- **Script-only (not runtime-overwritten):**
-  - `lbx/ubx` (wheel speed), `lbu/ubu` (control bounds), `idxsh/ns`, slack weights (`zl/Zl/zu/Zu`).
-- **Script + runtime-overwritten in controller:**
-  - Nonlinear bounds `lh/uh`, `W`, `W_e`, `yref`, `yref_e`, stage-0 initial-state enforcement, runtime obstacle parameter vector `p`.
-# MPC Cheatsheet (Current)
