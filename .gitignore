@@ -1,2 +1,3 @@
 c_generated_code/
 script/acados_ocp.json
+configs/mpc.rviz

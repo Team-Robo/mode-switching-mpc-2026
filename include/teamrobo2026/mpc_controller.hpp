@@ -173,7 +173,7 @@ private:
         double current_heading) const;
 
     // =========================================================================
-    // Obstacle selection — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic (24 params)
+    // Obstacle selection — 6 FOV-segmented static (closest per ±135° wedge) + up to 10 dynamic (32 params)
     // =========================================================================
     void selectObstacles(
         const std::vector<double>& obs_x,
@@ -182,7 +182,7 @@ private:
         double rx, double ry, double rtheta,
         int stage,
         double search_radius_sq,
-        double p_data[24]) const;
+        double p_data[32]) const;
 
     // Emergency stop for 3rd+ dynamic obstacle
     bool checkEmergencyStop(

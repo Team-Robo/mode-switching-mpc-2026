@@ -691,9 +691,11 @@ void MpcController::warmStartFromCurrentState(const std::vector<double>& current
 }
 
 // =============================================================================
-// selectObstacles — 1 closest LEFT static + 1 closest RIGHT static + up to 10 dynamic obstacles
-//   p_data layout: [x0,y0, x1,y1,   x2,y2, ..., x11,y11]
-//                   ^---static---^   ^-------dynamic-------^
+// selectObstacles — 6 FOV-segmented static + up to 10 dynamic obstacles
+//   The ±135° FOV (relative to robot heading) is split into 6 equal 45° wedges;
+//   the closest Euclidean point in each wedge becomes one static constraint.
+//   p_data layout: [x0,y0, ..., x5,y5,   x6,y6, ..., x15,y15]
+//                   ^---6 static (FOV)-^   ^------10 dynamic------^
 // =============================================================================
 void MpcController::selectObstacles(
     const std::vector<double>& obs_x,
@@ -702,41 +704,42 @@ void MpcController::selectObstacles(
     double rx, double ry, double rtheta,
     int stage,
     double search_radius_sq,
-    double p_data[24]) const
+    double p_data[32]) const
 {
-    constexpr int N_STATIC  = 2;
+    constexpr int N_STATIC  = 6;     // 6 FOV segments
     constexpr int N_DYNAMIC = 10;
+    constexpr double FOV_HALF = 135.0 * M_PI / 180.0;     // ±135°
+    const double seg_width = (2.0 * FOV_HALF) / N_STATIC; // 45° per segment
 
-    // --- static obstacles: one closest on LEFT, one closest on RIGHT ---
-    double left_x = 1000.0;
-    double left_y = 1000.0;
-    double right_x = 1000.0;
-    double right_y = 1000.0;
-    double left_dist_sq = std::numeric_limits<double>::max();
-    double right_dist_sq = std::numeric_limits<double>::max();
+    // --- static obstacles: closest point within each FOV wedge ---
+    double seg_x[N_STATIC], seg_y[N_STATIC], seg_d2[N_STATIC];
+    for (int s = 0; s < N_STATIC; ++s) {
+        seg_x[s] = 1000.0;
+        seg_y[s] = 1000.0;
+        seg_d2[s] = std::numeric_limits<double>::max();
+    }
     for (size_t j = 0; j < obs_x.size(); ++j) {
         double dx = obs_x[j] - rx, dy = obs_y[j] - ry;
         double d2 = dx*dx + dy*dy;
         if (d2 > search_radius_sq) continue;
-        const bool on_left = isLeft(rx, ry, rtheta, obs_x[j], obs_y[j]);
-        if (on_left) {
-            if (d2 < left_dist_sq) {
-                left_dist_sq = d2;
-                left_x = obs_x[j];
-                left_y = obs_y[j];
-            }
-        } else {
-            if (d2 < right_dist_sq) {
-                right_dist_sq = d2;
-                right_x = obs_x[j];
-                right_y = obs_y[j];
-            }
+        // bearing relative to robot heading, wrapped to [-pi, pi]
+        double bearing = std::atan2(dy, dx) - rtheta;
+        while (bearing >  M_PI) bearing -= 2.0 * M_PI;
+        while (bearing < -M_PI) bearing += 2.0 * M_PI;
+        if (bearing < -FOV_HALF || bearing > FOV_HALF) continue;  // outside FOV
+        int s = static_cast<int>((bearing + FOV_HALF) / seg_width);
+        if (s < 0) s = 0;
+        if (s >= N_STATIC) s = N_STATIC - 1;                      // clamp edge
+        if (d2 < seg_d2[s]) {
+            seg_d2[s] = d2;
+            seg_x[s] = obs_x[j];
+            seg_y[s] = obs_y[j];
         }
     }
-    p_data[0] = left_x;
-    p_data[1] = left_y;
-    p_data[2] = right_x;
-    p_data[3] = right_y;
+    for (int s = 0; s < N_STATIC; ++s) {
+        p_data[2*s + 0] = seg_x[s];
+        p_data[2*s + 1] = seg_y[s];
+    }
 
     // --- up to 10 dynamic obstacles (sorted by effective distance) ---
     struct DynCand { double x, y, eff_dist; };
@@ -1113,15 +1116,11 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     } else {
         min_dist_sq = std::pow(robot_radius_ + safety_margin_, 2.0);
     }
-    // 14 constraints: v_linear, omega, 12 × distance_sq (2 static + 10 dynamic)
-    double lh[14] = { -v_cap, -omega_cap,
-        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
-        min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq, min_dist_sq,
-        min_dist_sq, min_dist_sq };
-    double uh[14] = {  v_cap,  omega_cap,
-        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
-        1.0e9, 1.0e9, 1.0e9, 1.0e9, 1.0e9,
-        1.0e9, 1.0e9 };
+    // 18 constraints: v_linear, omega, 16 × distance_sq (6 static + 10 dynamic)
+    double lh[18], uh[18];
+    lh[0] = -v_cap;  lh[1] = -omega_cap;
+    uh[0] =  v_cap;  uh[1] =  omega_cap;
+    for (int c = 2; c < 18; ++c) { lh[c] = min_dist_sq; uh[c] = 1.0e9; }
 
     for (int i = 0; i < N_; ++i) {
         if (!check_set(
@@ -1238,10 +1237,10 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
             }
         }
 
-        // ---- obstacle parameters — 24 values: 2 static + 10 dynamic ----
-        double p_data[24];
+        // ---- obstacle parameters — 32 values: 6 static (FOV-segmented) + 10 dynamic ----
+        double p_data[32];
         if (clear_obstacles) {
-            for (int _k = 0; _k < 24; ++_k) p_data[_k] = 1000.0;
+            for (int _k = 0; _k < 32; ++_k) p_data[_k] = 1000.0;
         } else {
             double pred_x, pred_y;
             if (i == 0) {
@@ -1274,7 +1273,7 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
         }
 
         if (!check_set(
-                jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 24),
+                jackal_diff_drive_acados_update_params(acados_ocp_capsule_, i, p_data, 32),
                 "jackal_diff_drive_acados_update_params", "p", i)) {
             return false;
         }

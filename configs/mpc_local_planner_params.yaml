@@ -4,7 +4,7 @@ heading_weight_mult_dynamic: 0.44999999999999996
 accel_weight_mult_dynamic: 4.9711669468300554
 vel_weight_mult_dynamic: 1.113057650495854
 
-weight_position_error: 155.0
+weight_position_error: 110.0
 weight_heading_error: 92.0
 weight_velocity: 50.0
 weight_acceleration: 0.0003088547426299309
