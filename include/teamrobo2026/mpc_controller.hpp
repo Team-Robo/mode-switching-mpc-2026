@@ -125,6 +125,7 @@ private:
     bool solveOCP(const std::vector<double>& x_ref,
                   const std::vector<double>& y_ref,
                   const std::vector<double>& theta_ref,
+                  const std::vector<double>& raw_theta_ref,
                   const std::vector<double>& current_state,
                   const std::vector<double>& obs_x,
                   const std::vector<double>& obs_y);

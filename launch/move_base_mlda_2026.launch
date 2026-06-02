@@ -49,7 +49,7 @@
     </group>
     <node pkg="teamrobo2026" type="laser_scan_to_point_cloud_node" name="laser_scan_to_point_cloud" output="screen">
         <param name="scan_topic" value="/$(arg laser_scan_topic)" />
-        <param name="laser_frame" value="mid_laser" />
+        <param name="laser_frame" value="front_laser" />
     </node>
     <node pkg="teamrobo2026" type="occupancy_to_cloud_node" name="map_to_cloud" output="screen"></node>
 </launch>

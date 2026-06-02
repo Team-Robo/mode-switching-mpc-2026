@@ -803,6 +803,7 @@ bool MpcController::checkEmergencyStop(
 bool MpcController::solveOCP(const std::vector<double>& x_ref,
                        const std::vector<double>& y_ref,
                        const std::vector<double>& theta_ref,
+                       const std::vector<double>& raw_theta_ref,
                        const std::vector<double>& current_state,
                        const std::vector<double>& obs_x,
                        const std::vector<double>& obs_y
@@ -952,45 +953,40 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     // 4b. ROTATION_SHIM — overrides all non-DYNAMIC_OBS modes whenever the
     //     robot heading is too far off the path heading.
     // =====================================================================
-    // if (mode_ != ControlMode::DYNAMIC_OBS) {
-    //     // Angular error from robot heading to first meaningful path heading.
-    //     // theta_ref is the forward path heading — during reversal this will
-    //     // naturally be ~180° off, so reversal is covered automatically.
-    //     const double path_heading = (theta_ref.size() > 1) ? theta_ref[1] : 
-    //                                 (!theta_ref.empty() ? theta_ref[0] : current_state[2]);
-    //     double angular_err = path_heading - current_state[2];
-    //     while (angular_err >  M_PI) angular_err -= 2.0 * M_PI;
-    //     while (angular_err < -M_PI) angular_err += 2.0 * M_PI;
+    if (mode_ != ControlMode::DYNAMIC_OBS) {
+        const double path_heading = (raw_theta_ref.size() > 1) ? raw_theta_ref[1] :
+                                    (!raw_theta_ref.empty() ? raw_theta_ref[0] : current_state[2]);
+        double angular_err = path_heading - current_state[2];
+        while (angular_err >  M_PI) angular_err -= 2.0 * M_PI;
+        while (angular_err < -M_PI) angular_err += 2.0 * M_PI;
 
-    //     // shim_exit_heading_deg_ reused as the ENGAGE threshold (e.g. 90°).
-    //     // Disengage at half to avoid chattering at the boundary.
-    //     const double engage_rad    = shim_exit_heading_deg_ * M_PI / 180.0;
-    //     const double disengage_rad = engage_rad * 0.5;
+        const double engage_rad    = shim_exit_heading_deg_ * M_PI / 180.0;
+        const double disengage_rad = engage_rad * 0.5;
 
-    //     if (!shim_active_ && std::fabs(angular_err) > engage_rad) {
-    //         shim_active_    = true;
-    //         shim_turn_left_ = (angular_err > 0.0);
-    //         ROS_INFO("ROTATION_SHIM ON: err=%.1f deg → turning %s",
-    //                 angular_err * 180.0 / M_PI, shim_turn_left_ ? "LEFT" : "RIGHT");
-    //     }
-    //     if (shim_active_ && std::fabs(angular_err) < disengage_rad) {
-    //         shim_active_ = false;
-    //         ROS_INFO("ROTATION_SHIM OFF: aligned to %.1f deg (< %.1f deg threshold)",
-    //                 std::fabs(angular_err) * 180.0 / M_PI,
-    //                 disengage_rad * 180.0 / M_PI);
-    //     }
+        if (!shim_active_ && std::fabs(angular_err) > engage_rad) {
+            shim_active_    = true;
+            shim_turn_left_ = (angular_err > 0.0);
+            ROS_INFO("ROTATION_SHIM ON: err=%.1f deg → turning %s",
+                    angular_err * 180.0 / M_PI, shim_turn_left_ ? "LEFT" : "RIGHT");
+        }
+        if (shim_active_ && std::fabs(angular_err) < disengage_rad) {
+            shim_active_ = false;
+            ROS_INFO("ROTATION_SHIM OFF: aligned to %.1f deg (< %.1f deg threshold)",
+                    std::fabs(angular_err) * 180.0 / M_PI,
+                    disengage_rad * 180.0 / M_PI);
+        }
 
-    //     if (shim_active_) {
-    //         mode_         = ControlMode::ROTATION_SHIM;
-    //         display_text_ = "ROT_SHIM";
-    //         ROS_INFO_THROTTLE(0.5, "ROTATION_SHIM: spinning %s (err=%.1f deg)",
-    //                         shim_turn_left_ ? "LEFT" : "RIGHT",
-    //                         angular_err * 180.0 / M_PI);
-    //     }
-    // } else {
-    //     // Dynamic obstacle clears the shim so it re-evaluates once it clears.
-    //     shim_active_ = false;
-    // }
+        if (shim_active_) {
+            mode_         = ControlMode::ROTATION_SHIM;
+            display_text_ = "ROT_SHIM";
+            ROS_INFO_THROTTLE(0.5, "ROTATION_SHIM: spinning %s (err=%.1f deg)",
+                            shim_turn_left_ ? "LEFT" : "RIGHT",
+                            angular_err * 180.0 / M_PI);
+        }
+    } else {
+        // Dynamic obstacle clears the shim so it re-evaluates once it clears.
+        shim_active_ = false;
+    }
 
     // =========================================================================
     // 4c. ROTATION_SHIM EARLY-EXIT — bypass the ACADOS solver completely.
@@ -1002,23 +998,23 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     //     return immediately so the warm solution stays undisturbed for when
     //     normal mode resumes.
     // =========================================================================
-    // if (mode_ == ControlMode::ROTATION_SHIM) {
-    //     v_opt_ = 0.0;
-    //     w_opt_ = shim_turn_left_ ? shim_omega_ : -shim_omega_;
-    //     if (bench_log_enabled_) {
-    //         const double total_ms = (ros::WallTime::now() - t_start).toSec() * 1e3;
-    //         ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
-    //             "[BENCH][solveOCP] early-exit(rotation_shim) total="
-    //             << total_ms << " ms"
-    //             << " | init_state=" << (t_after_init - t_start).toSec() * 1e3
-    //             << " ms"
-    //             << " | predict_dyn=" << (t_after_predict - t_after_init).toSec() * 1e3
-    //             << " ms"
-    //             << " | mode_detection=" << (t_after_mode - t_after_predict).toSec() * 1e3
-    //             << " ms");
-    //     }
-    //     return true;
-    // }
+    if (mode_ == ControlMode::ROTATION_SHIM) {
+        v_opt_ = 0.0;
+        w_opt_ = shim_turn_left_ ? shim_omega_ : -shim_omega_;
+        if (bench_log_enabled_) {
+            const double total_ms = (ros::WallTime::now() - t_start).toSec() * 1e3;
+            ROS_INFO_STREAM_THROTTLE(bench_log_period_s_,
+                "[BENCH][solveOCP] early-exit(rotation_shim) total="
+                << total_ms << " ms"
+                << " | init_state=" << (t_after_init - t_start).toSec() * 1e3
+                << " ms"
+                << " | predict_dyn=" << (t_after_predict - t_after_init).toSec() * 1e3
+                << " ms"
+                << " | mode_detection=" << (t_after_mode - t_after_predict).toSec() * 1e3
+                << " ms");
+        }
+        return true;
+    }
 
     // =========================================================================
     // 5. RUSH_GOAL WARM-START
@@ -1047,10 +1043,6 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
             break;
 
         case ControlMode::ROTATION_SHIM:
-            // Pure in-place rotation — zero forward velocity, constrained omega.
-            // Position weight zeroed so the solver doesn't fight the spin with
-            // xy-tracking cost.  Heading weight boosted to help the solver converge
-            // even though we bypass its output in run().
             v_cap                  = 0.0;
             omega_cap              = shim_omega_;
             effective_accel_weight = weight_acceleration_;
@@ -1099,7 +1091,7 @@ bool MpcController::solveOCP(const std::vector<double>& x_ref,
     // 7. REVERSAL OVERLAY
     // =========================================================================
     std::vector<double> effective_theta_ref = theta_ref;
-    // in_reversal_ = checkReversalNeeded(theta_ref, current_state[2]);
+    // in_reversal_ = checkReversalNeeded(raw_theta_ref, current_state[2]);
     // if (in_reversal_) {
     //     reverse_theta_ref_ = computeReverseThetaRef(x_ref, y_ref, current_state[2]);
     //     effective_theta_ref = reverse_theta_ref_;
@@ -1622,22 +1614,30 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         const auto predicted_for_behavior = predictObstaclesTrajectory(dynamic_obstacles_, dt, N_);
         applyDynamicBehaviorPlanning(x_ref_, y_ref_, predicted_for_behavior, current_state_, dt);
 
-        std::vector<double> theta_sub;
+        std::vector<double> smooth_theta_ref;
         if (enable_heading_smoothing_) {
-            theta_sub = buildSmoothedHeadingRefFromPath(
+            smooth_theta_ref = buildSmoothedHeadingRefFromPath(
                 x_ref_, y_ref_, current_state_[2]);
         } else {
-            theta_sub = buildHeadingRefFromPath(
+            smooth_theta_ref = buildHeadingRefFromPath(
                 x_ref_, y_ref_, current_state_[2]);
         }
-        while (!theta_sub.empty() && theta_sub.size() < x_ref_.size())
-            theta_sub.push_back(theta_sub.back());
-        if (goal_pose_valid_ && !theta_sub.empty()) {
-            theta_sub.back() = headingPreprocess(theta_sub.back(), goal_yaw_);
+        while (!smooth_theta_ref.empty() && smooth_theta_ref.size() < x_ref_.size())
+            smooth_theta_ref.push_back(smooth_theta_ref.back());
+        if (goal_pose_valid_ && !smooth_theta_ref.empty()) {
+            smooth_theta_ref.back() = headingPreprocess(smooth_theta_ref.back(), goal_yaw_);
         }
-        if (theta_sub.empty()) {
+        if (smooth_theta_ref.empty()) {
             writeVelocityCommand(0.0, 0.0, cmd_vel);
             return false;
+        }
+
+        std::vector<double> raw_theta_ref = buildHeadingRefFromPath(
+            x_ref_, y_ref_, current_state_[2]);
+        while (!raw_theta_ref.empty() && raw_theta_ref.size() < x_ref_.size())
+            raw_theta_ref.push_back(raw_theta_ref.back());
+        if (goal_pose_valid_ && !raw_theta_ref.empty()) {
+            raw_theta_ref.back() = headingPreprocess(raw_theta_ref.back(), goal_yaw_);
         }
 
         std::vector<double> all_obs_x, all_obs_y;
@@ -1648,7 +1648,7 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
         t_after_theta_obs = ros::WallTime::now();
 
         retry_profile_active_ = false;
-        bool success = solveOCP(x_ref_, y_ref_, theta_sub,
+        bool success = solveOCP(x_ref_, y_ref_, smooth_theta_ref, raw_theta_ref,
                                 current_state_, all_obs_x, all_obs_y);
 
         const int retry_attempts = std::max(0, retry_profile_max_attempts_);
@@ -1657,7 +1657,7 @@ bool MpcController::runOnce(geometry_msgs::Twist& cmd_vel) {
                 retry_profile_active_ = true;
                 ROS_WARN("MPC retry profile attempt %d/%d (mode=%s)",
                          attempt, retry_attempts, display_text_.c_str());
-                success = solveOCP(x_ref_, y_ref_, theta_sub,
+                success = solveOCP(x_ref_, y_ref_, smooth_theta_ref, raw_theta_ref,
                                    current_state_, all_obs_x, all_obs_y);
                 if (success) {
                     ROS_WARN("MPC retry profile recovered on attempt %d/%d",
