@@ -136,6 +136,7 @@ private:
 
     // Utility
     double quaternionToYaw(const geometry_msgs::Quaternion& q);
+    double unwrapYaw(double wrapped_yaw);   // stateful, free-running: continuous yaw from wrapped measurement
     double headingPreprocess(double center, double target) const;
     double diffAngle(double a1, double a2) const;
     void   findClosestPoint(const std::vector<double>& x_ref,
@@ -286,6 +287,12 @@ private:
     // Runtime state
     // =========================================================================
     std::vector<double> current_state_;   // [x, y, theta, vr, vl]
+
+    // Measured-yaw unwrap state (keeps current_state_[2] continuous across the +-pi seam)
+    bool   yaw_unwrap_init_ = false;  // false => next unwrapYaw() seeds from the raw value
+    double yaw_unwrap_prev_ = 0.0;    // previous wrapped measurement
+    double yaw_unwrapped_   = 0.0;    // accumulated continuous yaw
+
     bool goal_pose_valid_ = false;
     double goal_x_ = 0.0;
     double goal_y_ = 0.0;

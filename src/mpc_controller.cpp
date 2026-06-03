@@ -206,7 +206,7 @@ void MpcController::cleanupAcadosSolver() {
 // Callbacks
 // =============================================================================
 void MpcController::callbackOdom(const nav_msgs::Odometry::ConstPtr& msg) {
-    double yaw = quaternionToYaw(msg->pose.pose.orientation);
+    double yaw = unwrapYaw(quaternionToYaw(msg->pose.pose.orientation));
     double v   = msg->twist.twist.linear.x;
     double w   = msg->twist.twist.angular.z;
     current_state_[0] = msg->pose.pose.position.x;
@@ -297,6 +297,12 @@ bool MpcController::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan,
         }
     }
 
+    // NOTE: the measured-yaw unwrap (unwrapYaw) is intentionally free-running and is NOT
+    // reset here. setPlan() is move_base's BaseLocalPlanner::setPlan override, called on
+    // every global-plan refresh (not once per goal); re-seeding the unwrap here would collapse
+    // the accumulated continuous yaw back to [-pi, pi] and reintroduce a ~2pi jump near the
+    // +-pi seam. The reference is rebuilt from current_state_[2] every solve, so the unwrapped
+    // yaw's absolute magnitude is irrelevant to tracking accuracy.
     ingestGlobalPlan(xs, ys);
     if (goal_pose_valid_) {
         if (theta_ref_.empty()) {
@@ -311,7 +317,7 @@ bool MpcController::setPlan(const std::vector<geometry_msgs::PoseStamped>& plan,
 void MpcController::updateRobotPose(const geometry_msgs::PoseStamped& pose) {
     current_state_[0] = pose.pose.position.x;
     current_state_[1] = pose.pose.position.y;
-    current_state_[2] = quaternionToYaw(pose.pose.orientation);
+    current_state_[2] = unwrapYaw(quaternionToYaw(pose.pose.orientation));
 }
 
 bool MpcController::getGoalPose(double& gx, double& gy, double& gyaw) const {
@@ -375,10 +381,28 @@ double MpcController::quaternionToYaw(const geometry_msgs::Quaternion& q) {
     return std::atan2(2.0*(q.z*q.w + q.x*q.y), 1.0 - 2.0*(q.y*q.y + q.z*q.z));
 }
 
+double MpcController::unwrapYaw(double wrapped_yaw) {
+    // Accumulate the per-step delta (wrapped to (-pi, pi]) onto a running total so the
+    // measured yaw stays continuous across the +-pi seam and matches the unwrapped reference.
+    if (!yaw_unwrap_init_) {
+        yaw_unwrap_init_ = true;
+        yaw_unwrap_prev_ = wrapped_yaw;
+        yaw_unwrapped_   = wrapped_yaw;
+        return yaw_unwrapped_;
+    }
+    double delta = wrapped_yaw - yaw_unwrap_prev_;
+    if (delta >  M_PI) delta -= 2.0 * M_PI;   // wrap step to (-pi, pi]
+    if (delta < -M_PI) delta += 2.0 * M_PI;
+    yaw_unwrapped_  += delta;
+    yaw_unwrap_prev_ = wrapped_yaw;
+    return yaw_unwrapped_;
+}
+
 double MpcController::headingPreprocess(double center, double target) const {
-    while (target < center - M_PI) target += 2.0 * M_PI;
-    while (target > center + M_PI) target -= 2.0 * M_PI;
-    return target;
+    // nearest 2*pi-equivalent of target to center; O(1), NaN-safe
+    double d = target - center;                              // NaN -> NaN, no infinite loop
+    d -= 2.0 * M_PI * std::floor((d + M_PI) / (2.0 * M_PI)); // wrap to (-pi, pi]
+    return center + d;
 }
 
 double MpcController::diffAngle(double a1, double a2) const {
